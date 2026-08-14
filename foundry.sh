@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.34
+FOUNDRY_VERSION=2026-08-14.35
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -219,7 +219,7 @@ selfcheck() {
              push_base push_logs push_results push_model push_model_split \
              push_card pull_logs get_imatrix get_calib wait_calib im_size \
              im_plan im_shard im_range im_merge im_merge_all im_stats \
-             im_status push_shards push_quants catch_up plan ls_main ls_metrics ls_corpora \
+             im_status push_shards push_quants catch_up audit plan ls_main ls_metrics ls_corpora \
              get_recipe use_gpus apply_gpus list_repo fetch_one \
              write_kld_readme send_base get_base; do
         type -t $f > /dev/null 2>&1 || missing="$missing $f"
@@ -1460,7 +1460,17 @@ kld_ext() {
         echo "  get_external unsloth/Qwen3.8-27B-GGUF '*UD-IQ3_XXS*'"
         return 1
     fi
+    local todo="" name
     for f in /gguf/external/*.gguf; do
+        name=$(basename "$f" .gguf)
+        if [ -f "/logs/kld-$EVALSET--$name.log" ] && [ "$KLD_FORCE" != "1" ]; then
+            echo "already measured: $name"
+            continue
+        fi
+        todo="$todo $f"
+    done
+    total=$(echo $todo | wc -w)
+    for f in $todo; do
         n=$(( n + 1 ))
         echo
         echo "########## external $n of $total ##########"
@@ -2607,6 +2617,72 @@ check_types() {
         echo "  $GGML_TYPES" | fold -s -w 70 | sed "s/^/    /"
         return 1
     fi
+}
+
+# What is published, what is measured, and what is neither. Run it before
+# writing the card: a quant in the repo with no measurement is a row of the
+# table that cannot be filled in.
+audit() {
+    need_preset || return 1
+    python3 - "$MAIN" "$METRICS" "$METRICS_KIND" "$EVALSET" << 'AUDITEOF'
+import os, glob, sys
+from huggingface_hub import HfApi
+
+main, metrics, kind, evalset = sys.argv[1:5]
+api = HfApi()
+
+def files(repo, t):
+    try:
+        return api.list_repo_files(repo, repo_type=t)
+    except Exception as e:
+        print("cannot read %s: %s" % (repo, str(e).splitlines()[0]))
+        return []
+
+published = sorted(f[:-5] for f in files(main, "model") if f.endswith(".gguf"))
+logs = files(metrics, kind)
+measured = set()
+for f in logs:
+    b = os.path.basename(f)
+    if b.startswith("kld-%s--" % evalset) and b.endswith(".log"):
+        measured.add(b[len("kld-%s--" % evalset):-4])
+
+local_logs = set()
+for p in glob.glob("/logs/kld-%s--*.log" % evalset):
+    local_logs.add(os.path.basename(p)[len("kld-%s--" % evalset):-4])
+
+print("published in %s: %d" % (main, len(published)))
+print("measured (in the metrics repo): %d" % len(measured))
+print("measured (on this box only, not uploaded): %d" % len(local_logs - measured))
+print()
+
+missing = [p for p in published if p not in measured and p not in local_logs]
+if missing:
+    print("PUBLISHED BUT NEVER MEASURED, %d:" % len(missing))
+    for p in missing:
+        here = os.path.exists("/gguf/%s.gguf" % p)
+        print("   %-46s %s" % (p, "on this box" if here else "not on this box"))
+    print()
+    print("on the box that holds them:  kld_all")
+else:
+    print("every published quant has a measurement")
+
+only_local = sorted(local_logs - measured)
+if only_local:
+    print()
+    print("measured here but not uploaded, %d:" % len(only_local))
+    for p in only_local:
+        print("  ", p)
+    print("run:  push_logs")
+
+ext = sorted(os.path.basename(p)[:-5] for p in glob.glob("/gguf/external/*.gguf"))
+un = [e for e in ext if e not in measured and e not in local_logs]
+if un:
+    print()
+    print("other publishers' files here, not measured, %d:" % len(un))
+    for e in un:
+        print("  ", e)
+    print("run:  kld_ext")
+AUDITEOF
 }
 
 # ladder_part I N
