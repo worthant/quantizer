@@ -43,6 +43,35 @@ apply_gpus() {
     fi
 }
 
+repo_ok() {
+    if [ -z "$METRICS" ]; then
+        echo "no preset loaded"
+        return 1
+    fi
+    if hf repo info $METRICS --repo-type $METRICS_KIND > /dev/null 2>&1; then
+        return 0
+    fi
+    echo
+    echo "The metrics repo does not exist, or your token cannot see it:"
+    echo "  $METRICS   (type: $METRICS_KIND)"
+    echo
+    echo "Create it with:   make_metrics"
+    echo "Or, if it exists as a model repo rather than a dataset, flip the type:"
+    echo "  METRICS_KIND=model ; save_state"
+    return 1
+}
+
+make_metrics() {
+    if [ -z "$METRICS" ]; then
+        echo "no preset loaded"
+        return 1
+    fi
+    echo "creating $METRICS as a $METRICS_KIND"
+    ask "create?" || return 1
+    hf repo create $METRICS --repo-type $METRICS_KIND
+    hf repo info $METRICS --repo-type $METRICS_KIND && echo "exists now"
+}
+
 autopush() {
     if [ "$AUTOPUSH" != "1" ] || [ -z "$METRICS" ] || [ ! -f "$1" ]; then
         return 0
@@ -318,10 +347,21 @@ MEASURE
   bench_all
   gen MODEL NGL "EXTRA"      llama-cli, 400 tokens, fixed seed
 
+IMATRIX, split across as many boxes as you like
+  get_calib NAME             the calibration corpus for a recipe build
+  IM_MODEL=/gguf/x.gguf      the model the imatrix is collected on
+  im_size                    tokens and total chunk count
+  im_plan N                  prints the command for each of N nodes
+  im_shard I N               node I of N. Uploads its shard when done
+  im_merge N                 pulls every shard, merges, uploads the result
+  im_stats FILE              sum of squared activations, for cross checking
+
 RESULTS
   results                    parse all logs into /logs/results.json
 
 UPLOAD, one job each
+  make_metrics               create the metrics repo if it does not exist
+  repo_ok                    check the metrics repo is reachable
   push_base                  reference logits, hash, README, logs -> metrics
                              splits into 45 GB parts when over the limit
   send_base user@host PORT   ship the reference straight to another box
@@ -1045,6 +1085,159 @@ gen() {
 }
 
 
+# ================================================================== imatrix, fanned out
+#
+# Splitting by chunk range, not by cutting the text file. Every node reads the
+# SAME corpus and takes its own slice with --from-chunk / --chunks, so the union
+# is bit-for-bit the chunking a single node would have produced. Merging is a
+# sum of squared activations, so --in-file gives the same answer as one long run.
+
+IM_CTX=512
+IM_BATCH=8192
+IM_CORPUS=/eval/calib_train.txt
+IM_MODEL=""
+
+get_calib() {
+    if [ -z "$1" ]; then
+        echo "get_calib NAME      e.g. get_calib nemotron-3.5-lightning"
+        echo "see what builds exist with: ls_corpora"
+        return 1
+    fi
+    fetch_one AtomicChat/calib-corpora dataset "builds/$1/calib_train.txt" $IM_CORPUS || return 1
+    im_size
+}
+
+im_size() {
+    if [ ! -f $IM_CORPUS ]; then
+        echo "no calibration corpus at $IM_CORPUS. Run get_calib."
+        return 1
+    fi
+    BYTES=$(stat -c %s $IM_CORPUS)
+    IM_TOKENS=$(( BYTES / 4 ))
+    IM_CHUNKS=$(( IM_TOKENS / IM_CTX ))
+    echo "corpus  : $IM_CORPUS"
+    echo "size    : $BYTES bytes, roughly $IM_TOKENS tokens"
+    echo "at ctx $IM_CTX that is about $IM_CHUNKS chunks"
+}
+
+# im_plan N  ->  prints the exact command for each of N nodes. Paste one per box.
+im_plan() {
+    if [ -z "$1" ] || [ -z "$IM_MODEL" ]; then
+        echo "im_plan N          after setting IM_MODEL=/gguf/<the q8 or bf16>.gguf"
+        echo "current IM_MODEL: ${IM_MODEL:-not set}"
+        return 1
+    fi
+    im_size || return 1
+    N=$1
+    PER=$(( IM_CHUNKS / N + 1 ))
+    echo
+    echo "$N nodes, about $PER chunks each"
+    echo "run get_calib and set IM_MODEL to the same file on every box, then:"
+    echo
+    I=0
+    while [ $I -lt $N ]; do
+        echo "  node $I:   im_shard $I $N"
+        I=$(( I + 1 ))
+    done
+    echo
+    echo "then on any one box:   im_merge $N"
+}
+
+im_shard() {
+    if [ -z "$2" ]; then
+        echo "im_shard INDEX TOTAL        index is 0 based"
+        return 1
+    fi
+    if [ ! -f "$IM_MODEL" ]; then
+        echo "IM_MODEL is not set or missing: ${IM_MODEL:-unset}"
+        return 1
+    fi
+    im_size || return 1
+
+    I=$1
+    N=$2
+    PER=$(( IM_CHUNKS / N + 1 ))
+    FROM=$(( I * PER ))
+    OUT=/imatrix/shard-$I-of-$N.gguf
+    mkdir -p /imatrix
+
+    echo "node $I of $N: chunks $FROM onward"
+    if [ $I -eq $(( N - 1 )) ]; then
+        echo "last node, runs to the end of the corpus"
+        LIMIT=""
+    else
+        echo "taking $PER chunks"
+        LIMIT="--chunks $PER"
+    fi
+    date
+    START=$(date +%s)
+
+    $BIN/llama-imatrix -m $IM_MODEL -f $IM_CORPUS -o $OUT \
+        -ngl 99 -c $IM_CTX -b $IM_BATCH -ub $IM_BATCH \
+        --parse-special --no-ppl \
+        --from-chunk $FROM $LIMIT \
+        2>&1 | tee /logs/imatrix-shard-$I-of-$N.log
+
+    echo "took $(( $(date +%s) - START )) seconds"
+    ls -lh $OUT
+    autopush /logs/imatrix-shard-$I-of-$N.log logs/imatrix-shard-$I-of-$N.log
+    if [ -f $OUT ]; then
+        hf upload $METRICS --repo-type $METRICS_KIND $OUT imatrix/shard-$I-of-$N.gguf \
+            && echo "  shard uploaded, the merging box can pick it up"
+    fi
+}
+
+im_merge() {
+    if [ -z "$1" ]; then
+        echo "im_merge N          N is the number of shards"
+        return 1
+    fi
+    need_preset || return 1
+    repo_ok || return 1
+    N=$1
+    mkdir -p /imatrix
+
+    echo "pulling shards from $METRICS"
+    hf download $METRICS --repo-type $METRICS_KIND --include "imatrix/*" --local-dir /imatrix
+    find /imatrix -name "shard-*-of-$N.gguf" | sort
+
+    GOT=$(find /imatrix -name "shard-*-of-$N.gguf" | wc -l)
+    if [ $GOT -ne $N ]; then
+        echo "only $GOT of $N shards are here. Wait for the rest, or pass the real count."
+        return 1
+    fi
+
+    ARGS=""
+    for f in $(find /imatrix -name "shard-*-of-$N.gguf" | sort); do
+        ARGS="$ARGS --in-file $f"
+    done
+    echo "merging:$ARGS"
+
+    $BIN/llama-imatrix $ARGS -o /imatrix/imatrix.gguf 2>&1 | tee /logs/imatrix-merge.log
+    ls -lh /imatrix/imatrix.gguf
+
+    echo
+    echo "=== merged statistics ==="
+    $BIN/llama-imatrix --in-file /imatrix/imatrix.gguf --show-statistics \
+        2>&1 | tee /logs/imatrix-stats.log | head -30
+    echo
+    echo "Sanity check: the sum of squared activations here should equal the sum"
+    echo "across the shards. Compare against im_stats on each shard."
+
+    autopush /logs/imatrix-merge.log logs/imatrix-merge.log
+    autopush /logs/imatrix-stats.log logs/imatrix-stats.log
+    hf upload $METRICS --repo-type $METRICS_KIND /imatrix/imatrix.gguf imatrix/imatrix.gguf
+}
+
+im_stats() {
+    if [ -z "$1" ]; then
+        echo "im_stats FILE.gguf"
+        return 1
+    fi
+    $BIN/llama-imatrix --in-file $1 --show-statistics 2>&1 | head -30
+}
+
+
 # ================================================================== results
 
 results() {
@@ -1114,6 +1307,7 @@ PYEOF
 # reference, so it gets published. Over 45 GB it goes up as numbered parts.
 push_base() {
     need_preset || return 1
+    repo_ok || return 1
     if [ ! -f /logs/base-$EVALSET.log ]; then
         echo "no base log yet. Run base first."
         return 1
@@ -1231,12 +1425,14 @@ send_base() {
 
 push_logs() {
     need_preset || return 1
+    repo_ok || return 1
     du -sh /logs
     hf upload $METRICS --repo-type $METRICS_KIND /logs logs
 }
 
 push_results() {
     need_preset || return 1
+    repo_ok || return 1
     if [ ! -f /logs/results.json ]; then
         echo "no results.json. Run results first."
         return 1
