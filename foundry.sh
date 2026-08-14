@@ -13,7 +13,69 @@ export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
 
 BIN=/llama.cpp/build/bin
+STATE=/state.sh
 CTX=4096
+
+# Every log that says anything useful goes to the metrics repo the moment it
+# is written. Set AUTOPUSH=0 to keep things local while experimenting.
+AUTOPUSH=1
+
+# Which GPUs the measurement runs may use. "all" means do not restrict.
+# The reference needs all of them (bf16 does not fit on two cards), but the
+# quant runs are deliberately held to a setup the community can relate to.
+GPUS=all
+
+use_gpus() {
+    if [ -z "$1" ]; then
+        echo "use_gpus 0,1     or     use_gpus all       current: $GPUS"
+        return 1
+    fi
+    GPUS=$1
+    save_state
+    echo "quant measurements will run on GPUs: $GPUS"
+}
+
+apply_gpus() {
+    if [ "$GPUS" = "all" ]; then
+        unset CUDA_VISIBLE_DEVICES
+    else
+        export CUDA_VISIBLE_DEVICES=$GPUS
+    fi
+}
+
+autopush() {
+    if [ "$AUTOPUSH" != "1" ] || [ -z "$METRICS" ] || [ ! -f "$1" ]; then
+        return 0
+    fi
+    if hf upload $METRICS --repo-type $METRICS_KIND "$1" "$2" > /dev/null 2>&1; then
+        echo "  uploaded -> $METRICS :: $2"
+    else
+        echo "  UPLOAD FAILED for $2, run push_logs later"
+    fi
+}
+
+# Bash functions live inside one shell process, so a new tmux pane is a new
+# shell that knows nothing. save_state writes the current preset to /state.sh
+# and the bottom of this file reads it back, so every pane agrees.
+save_state() {
+    cat > $STATE << STATEEOF
+MAIN=$MAIN
+METRICS=$METRICS
+METRICS_KIND=$METRICS_KIND
+UPSTREAM=$UPSTREAM
+EVALSET=$EVALSET
+EVAL=$EVAL
+BASE=$BASE
+CTX=$CTX
+GPUS=$GPUS
+AUTOPUSH=$AUTOPUSH
+STATEEOF
+}
+
+persist_shell() {
+    grep -q "source /foundry.sh" ~/.bashrc 2>/dev/null || echo "source /foundry.sh" >> ~/.bashrc
+    echo "Added to ~/.bashrc. Every new tmux pane now loads this by itself."
+}
 
 # Which held-out set we measure on. Everything downstream is named after it,
 # so several sets can live side by side without overwriting each other.
@@ -29,6 +91,7 @@ use_evalset() {
     EVALSET=$1
     EVAL=/eval/$1.txt
     BASE=/kld/base-$1.kld
+    save_state
     echo "eval set  : $EVALSET"
     echo "corpus    : $EVAL"
     echo "reference : $BASE"
@@ -42,6 +105,7 @@ use_nemotron() {
     METRICS=AtomicChat/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF-metrics
     METRICS_KIND=dataset
     UPSTREAM=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+    save_state
     show_preset
 }
 
@@ -50,6 +114,7 @@ use_qwen() {
     METRICS=AtomicChat/Qwen3.8-27B-GGUF-metrics
     METRICS_KIND=dataset
     UPSTREAM=Qwen/Qwen3.8-27B
+    save_state
     show_preset
 }
 
@@ -128,19 +193,60 @@ status() {
     BENCHES=$(ls /logs/bench-*.json 2>/dev/null | wc -l)
     echo "  [$([ $BENCHES -gt 0 ] && echo x || echo ' ')] bench logs: $BENCHES     ->  run:  bench_all"
     mark "results.json"       /logs/results.json         "results"
+
+    echo
+    echo "  uploaded to $METRICS:"
+    if [ -z "$METRICS" ]; then
+        echo "    no preset loaded"
+    else
+        python3 - "$METRICS" "$METRICS_KIND" "$EVALSET" << 'UPEOF'
+import sys
+from huggingface_hub import HfApi
+metrics, kind, evalset = sys.argv[1:4]
+try:
+    files = set(HfApi().list_repo_files(metrics, repo_type=kind))
+except Exception as e:
+    print("    cannot read the repo: %s" % e)
+    print("    if it says 404, flip METRICS_KIND between dataset and model")
+    sys.exit(0)
+
+def row(label, present, cmd):
+    print("    [%s] %-22s %s" % ("x" if present else " ",
+                                 label,
+                                 "" if present else "->  run:  " + cmd))
+
+row("base log", "logs/base-%s.log" % evalset in files, "push_base")
+row("environment", "logs/env.txt" in files, "push_base")
+kld = [f for f in files if f.startswith("logs/kld-")]
+row("kld logs (%d)" % len(kld), bool(kld), "push_logs")
+bench = [f for f in files if f.startswith("logs/bench-")]
+row("bench logs (%d)" % len(bench), bool(bench), "push_logs")
+row("results.json", "results.json" in files, "push_results")
+UPEOF
+    fi
+
     echo
     echo "  full command list: help_me      pick by number: menu"
+    echo "  remote view: plan               new tmux panes: persist_shell"
     echo
 }
 
 menu() {
+    echo
+    echo "  model    : ${MAIN:-none, pick a preset first}"
+    echo "  eval set : $EVALSET   context: $CTX"
+    echo
     PS3="
 number: "
     select picked in \
-        "status" "cuda_check" "fix_cuda_compat" "gpu_test" "setup" "build 120" \
-        "get_eval" "get_bf16" "get_quants" "find_bf16" \
-        "base" "get_base" "wait_base" "kld_all" "bench_all" "results" \
+        "use_nemotron" "use_qwen" \
+        "get_eval_set neutral" "get_eval_set agentic" "get_eval_set code" \
+        "plan" "status" "help_me" \
+        "cuda_check" "gpu_test" "setup" "build 120" \
+        "get_bf16" "get_quants" "find_bf16" "eval_size" \
+        "base" "kld_all" "bench_all" "results" \
         "push_base" "push_logs" "push_results" \
+        "ls_main" "ls_metrics" "ls_corpora" \
         "quit"
     do
         if [ "$picked" = "quit" ] || [ -z "$picked" ]; then
@@ -167,6 +273,7 @@ ORIENTATION
   menu                       pick a command by number
   help_me                    this list
   reload                     re-pull this script from github
+  persist_shell              auto-source this in every new tmux pane
 
 BOX SETUP
   check                      disk, GPUs, cores, RAM
@@ -215,7 +322,11 @@ RESULTS
   results                    parse all logs into /logs/results.json
 
 UPLOAD, one job each
-  push_base                  reference + its log   -> metrics repo
+  push_base                  reference logits, hash, README, logs -> metrics
+                             splits into 45 GB parts when over the limit
+  send_base user@host PORT   ship the reference straight to another box
+  use_gpus 0,1               how many GPUs the quant runs may use
+  AUTOPUSH=0                 stop uploading every log as it is written
   push_logs                  everything in /logs   -> metrics repo
   push_results               results.json          -> metrics repo
   push_model FILE            one gguf              -> main repo
@@ -624,6 +735,7 @@ set_ctx() {
         return 1
     fi
     CTX=$1
+    save_state
     echo "context is now $CTX"
     eval_size
 }
@@ -678,15 +790,6 @@ get_one() {
     ask "download?" || return 1
     hf download $MAIN --include "$1" --local-dir /gguf
     ls -la /gguf
-}
-
-get_base() {
-    need_preset || return 1
-    hf download $METRICS --repo-type $METRICS_KIND --include "kld/*" --local-dir /kld
-    if [ -f /kld/kld/base-$EVALSET.kld ]; then
-        mv /kld/kld/base-$EVALSET.kld $BASE
-    fi
-    ls -lh $BASE
 }
 
 
@@ -851,21 +954,29 @@ base() {
     eval_size || return 1
 
     echo
-    echo "Writing the reference. All GPUs. Expect 4 to 8 minutes."
+    echo "Writing the reference. This one uses ALL GPUs regardless of use_gpus,"
+    echo "because bf16 does not fit on fewer. Say so in the model card."
     echo "Warnings about unused blk.52.nextn tensors are normal: that is the MTP"
     echo "block, which a plain forward pass never executes."
     date
     START=$(date +%s)
 
+    unset CUDA_VISIBLE_DEVICES
     $BIN/llama-perplexity -m $BF16_FIRST -f $EVAL \
         --kl-divergence-base $BASE -c $CTX -ngl 99 \
         2>&1 | tee /logs/base-$EVALSET.log
+
+    autopush /logs/base-$EVALSET.log logs/base-$EVALSET.log
 
     echo "took $(( $(date +%s) - START )) seconds"
     echo
     echo "=== SIZE OF THE REFERENCE ==="
     ls -lh $BASE
-    echo "Under a few GB means shipping it through HF to the other box is fine."
+    echo
+    echo "This file holds fp16 logits over the whole vocabulary for every scored"
+    echo "token, so it is large by design and it is NOT worth shipping anywhere."
+    echo "It reproduces from the bf16 weights in the time you just watched."
+    echo "Measure the quants on this same box, and publish the log, not the blob."
 }
 
 kld() {
@@ -873,8 +984,9 @@ kld() {
     if [ ! -f $BASE ]; then echo "no reference at $BASE. Run base, or get_base."; return 1; fi
 
     NAME=$(basename $1 .gguf)
+    apply_gpus
     echo "--------------------------------------------------"
-    echo "KLD on $EVALSET: $NAME"
+    echo "KLD on $EVALSET: $NAME   (GPUs: $GPUS)"
     START=$(date +%s)
 
     $BIN/llama-perplexity -m $1 -f $EVAL \
@@ -882,6 +994,7 @@ kld() {
         2>&1 | tee /logs/kld-$EVALSET--$NAME.log
 
     echo "took $(( $(date +%s) - START )) seconds"
+    autopush /logs/kld-$EVALSET--$NAME.log logs/kld-$EVALSET--$NAME.log
 }
 
 kld_all() {
@@ -902,6 +1015,7 @@ bench() {
     CUDA_VISIBLE_DEVICES=0 $BIN/llama-bench -m $1 -p 512 -n 128 -ngl 99 -r 5 -o json \
         > /logs/bench-$NAME.json
     head -40 /logs/bench-$NAME.json
+    autopush /logs/bench-$NAME.json logs/bench-$NAME.json
 }
 
 bench_all() {
@@ -989,17 +1103,130 @@ for r in rows:
 print()
 print('written to /logs/results.json')
 PYEOF
+    autopush /logs/results.json results.json
 }
 
 
 # ================================================================== upload
 
+# The .kld holds fp16 logits over the whole vocabulary for every scored token.
+# People asked for it so they can compare their own quants against the same
+# reference, so it gets published. Over 45 GB it goes up as numbered parts.
 push_base() {
     need_preset || return 1
-    ls -lh $BASE
-    hf upload $METRICS --repo-type $METRICS_KIND $BASE kld/base-$EVALSET.kld
+    if [ ! -f /logs/base-$EVALSET.log ]; then
+        echo "no base log yet. Run base first."
+        return 1
+    fi
+
     hf upload $METRICS --repo-type $METRICS_KIND /logs/base-$EVALSET.log logs/base-$EVALSET.log
-    echo "Reference is up. The other box can pull it now."
+    [ -f /logs/env.txt ] && hf upload $METRICS --repo-type $METRICS_KIND /logs/env.txt logs/env.txt
+    [ -f /logs/llama-commit.txt ] && hf upload $METRICS --repo-type $METRICS_KIND /logs/llama-commit.txt logs/llama-commit.txt
+
+    if [ ! -f $BASE ]; then
+        echo "no .kld on disk, only the log went up"
+        return 0
+    fi
+
+    SIZE=$(stat -c %s $BASE)
+    echo
+    echo "reference blob: $(( SIZE / 1000000000 )) GB"
+    echo "hashing, this takes a minute on a file this size"
+    sha256sum $BASE | sed "s|/kld/||" > /kld/base-$EVALSET.kld.sha256
+    cat /kld/base-$EVALSET.kld.sha256
+
+    write_kld_readme
+
+    if [ $SIZE -gt 45000000000 ]; then
+        echo
+        echo "over the 50 GB per-file limit, splitting into 45 GB parts"
+        rm -rf /kld/parts
+        mkdir -p /kld/parts
+        split -b 45G -d --additional-suffix=.part $BASE /kld/parts/base-$EVALSET.kld.
+        ls -lh /kld/parts
+        cp /kld/base-$EVALSET.kld.sha256 /kld/parts/
+        cp /kld/README.md /kld/parts/
+        echo
+        ask "upload the parts now?" || return 0
+        hf upload $METRICS --repo-type $METRICS_KIND /kld/parts kld
+    else
+        ask "upload the blob now?" || return 0
+        hf upload $METRICS --repo-type $METRICS_KIND $BASE kld/base-$EVALSET.kld
+        hf upload $METRICS --repo-type $METRICS_KIND /kld/base-$EVALSET.kld.sha256 kld/base-$EVALSET.kld.sha256
+        hf upload $METRICS --repo-type $METRICS_KIND /kld/README.md kld/README.md
+    fi
+    echo "done"
+}
+
+write_kld_readme() {
+    cat > /kld/README.md << READMEEOF
+# KL divergence reference logits
+
+Produced by \`llama-perplexity --kl-divergence-base\`. The file holds fp16
+logits over the full vocabulary for every scored token, so any quantization of
+this model can be measured against the same reference we used.
+
+- model    : bf16 weights of $MAIN
+- corpus   : $EVALSET held-out set from AtomicChat/calib-corpora
+- context  : $CTX
+- llama.cpp: see logs/llama-commit.txt
+- hardware : see logs/env.txt
+
+## If the file is split
+
+Parts are named \`base-$EVALSET.kld.NN.part\`. Reassemble in order, then check
+the hash:
+
+\`\`\`bash
+cat base-$EVALSET.kld.*.part > base-$EVALSET.kld
+sha256sum -c base-$EVALSET.kld.sha256
+\`\`\`
+
+## Using it
+
+\`\`\`bash
+llama-perplexity -m your-quant.gguf -f eval_neutral.txt \\
+  --kl-divergence-base base-$EVALSET.kld --kl-divergence -c $CTX -ngl 99
+\`\`\`
+
+Your corpus and context must match the ones above or the numbers mean nothing.
+READMEEOF
+    echo "wrote /kld/README.md"
+}
+
+# Pull the reference from the metrics repo, reassembling parts if needed.
+get_base() {
+    need_preset || return 1
+    hf download $METRICS --repo-type $METRICS_KIND --include "kld/*" --local-dir /kld
+
+    if [ -f /kld/kld/base-$EVALSET.kld ]; then
+        mv /kld/kld/base-$EVALSET.kld $BASE
+    elif ls /kld/kld/base-$EVALSET.kld.*.part > /dev/null 2>&1; then
+        echo "reassembling parts"
+        cat /kld/kld/base-$EVALSET.kld.*.part > $BASE
+        if [ -f /kld/kld/base-$EVALSET.kld.sha256 ]; then
+            cd /kld && sha256sum -c base-$EVALSET.kld.sha256 ; cd -
+        fi
+        rm -f /kld/kld/base-$EVALSET.kld.*.part
+    fi
+    ls -lh $BASE
+}
+
+# Straight box to box, no hub round trip. Much faster on a local-ish link.
+#   send_base root@1.2.3.4 41234
+send_base() {
+    if [ -z "$1" ]; then
+        echo "send_base user@host [ssh_port]"
+        echo "on vast, get host and port from: vastai ssh-url <id>"
+        return 1
+    fi
+    if [ ! -f $BASE ]; then
+        echo "no reference at $BASE"
+        return 1
+    fi
+    which rsync > /dev/null 2>&1 || apt-get install -y -qq rsync
+    ls -lh $BASE
+    rsync -avP -e "ssh -p ${2:-22} -o StrictHostKeyChecking=no" $BASE $1:$BASE
 }
 
 push_logs() {
@@ -1080,3 +1307,10 @@ run_quant_box() {
     push_logs
     push_results
 }
+
+
+# ================================================================== state
+# Read back whatever the last pane set, so a fresh tmux tab is not amnesiac.
+if [ -f /state.sh ]; then
+    . /state.sh
+fi
