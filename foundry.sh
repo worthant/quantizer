@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.16
+FOUNDRY_VERSION=2026-08-14.19
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -131,16 +131,55 @@ quant_files() {
         | sort
 }
 
+# Uses the python API rather than the cli. The cli's argument order changed
+# between huggingface_hub versions, and boxes rented at different times do not
+# have the same one, so the same command worked on one and failed on another.
+#
+# Every local is declared. This function used to assign a bare OUT, which is
+# the same global the caller uses for its output path, so the caller's path
+# was replaced by an error message and the next test on it broke.
+hf_put() {
+    python3 - "$1" "$2" "$3" "$4" << 'PUTEOF'
+import sys
+from huggingface_hub import HfApi
+local, remote, repo, kind = sys.argv[1:5]
+try:
+    HfApi().upload_file(path_or_fileobj=local, path_in_repo=remote,
+                        repo_id=repo, repo_type=kind)
+except Exception as e:
+    msg = str(e).splitlines()[0]
+    print(msg)
+    if "401" in msg:
+        print("that is an auth failure: the token is missing, wrong, or has no")
+        print("write access to " + repo)
+    sys.exit(1)
+PUTEOF
+}
+
+# These boxes are rented and ephemeral, so keeping the token in the shell
+# profile is a fair trade for not losing an upload in every new pane.
+save_token() {
+    if [ -z "$HF_TOKEN" ]; then
+        echo "export HF_TOKEN first, then run this"
+        return 1
+    fi
+    grep -q "export HF_TOKEN=" ~/.bashrc 2>/dev/null \
+        && sed -i "s|export HF_TOKEN=.*|export HF_TOKEN=$HF_TOKEN|" ~/.bashrc \
+        || echo "export HF_TOKEN=$HF_TOKEN" >> ~/.bashrc
+    echo "stored in ~/.bashrc, every new pane will have it"
+    echo "this box is disposable, but the token is not: revoke it when you are done"
+}
+
 autopush() {
-    if [ "$AUTOPUSH" != "1" ] || [ -z "$METRICS" ] || [ ! -f "$1" ]; then
+    local src_path="$1" dest_path="$2" err
+    if [ "$AUTOPUSH" != "1" ] || [ -z "$METRICS" ] || [ ! -f "$src_path" ]; then
         return 0
     fi
-    OUT=$(hf upload $METRICS --repo-type $METRICS_KIND "$1" "$2" 2>&1)
-    if [ $? -eq 0 ]; then
-        echo "  uploaded -> $METRICS :: $2"
+    if err=$(hf_put "$src_path" "$dest_path" "$METRICS" "$METRICS_KIND" 2>&1); then
+        echo "  uploaded -> $METRICS :: $dest_path"
     else
-        echo "  UPLOAD FAILED for $2:"
-        echo "$OUT" | sed "s/^/    /"
+        echo "  UPLOAD FAILED for $dest_path:"
+        echo "$err" | sed "s/^/    /"
     fi
 }
 
@@ -149,7 +188,7 @@ autopush() {
 # and the symptom is a command not found long after the damage.
 selfcheck() {
     MISSING=""
-    for f in save_state persist_shell reload find_repo use_model show_preset \
+    for f in save_state persist_shell save_token hf_put reload find_repo use_model show_preset \
              check repo_ok token_check make_metrics make_repos clean_run \
              setup build gpu_test get_tools check_pool fix_pool install_auto_fmt \
              setup_corpus build_corpus push_corpus corpus_check make_recipe \
@@ -193,6 +232,7 @@ BOX SETUP
   build 120                  compile. 120 blackwell, 90 hopper, 89 ada, 86 ampere
   gpu_test                   does ggml actually see the GPUs
   persist_shell              auto-source this in every new tmux pane
+  save_token                 keep HF_TOKEN in ~/.bashrc on this box
   clean_run                  wipe logs, kld and imatrix from a previous model
 
 REPOS
@@ -216,6 +256,9 @@ IMATRIX, split across as many boxes as you like
   pick_model                 choose IM_MODEL, bf16 first
   IM_TOKENS_EXACT=N          real token count, so shards come out even
   IM_BATCH=4096              lower it when the vocabulary is large
+  IM_NO_PPL=1                skip perplexity, a few percent faster but the run
+                             then prints nothing for its whole duration
+  IM_OFREQ=20                how often it reports, doubles as a heartbeat
   im_size / im_plan N
   im_shard I N               node I of N, 0 based
   im_range FROM COUNT LABEL  explicit range, for rebalancing a slow box
@@ -875,14 +918,14 @@ make_bf16() {
         echo "llama.cpp not cloned. Run build first."
         return 1
     fi
-    OUT=/gguf/$(basename $MAIN | sed "s/-GGUF//")-bf16.gguf
-    echo "converting /src -> $OUT"
+    BF16_OUT=/gguf/$(basename $MAIN | sed "s/-GGUF//")-bf16.gguf
+    echo "converting /src -> $BF16_OUT"
     echo "If it fails with NaN in token_embd, add --no-lazy and rerun."
     date
-    python3 /llama.cpp/convert_hf_to_gguf.py /src --outtype bf16 --outfile $OUT \
+    python3 /llama.cpp/convert_hf_to_gguf.py /src --outtype bf16 --outfile $BF16_OUT \
         2>&1 | tee /logs/convert.log
     date
-    ls -lh $OUT
+    ls -lh $BF16_OUT
     echo
     echo "Publish it with push_model_split so it clears the 50 GB per-file limit."
 }
@@ -1297,7 +1340,7 @@ base() {
     START=$(date +%s)
 
     unset CUDA_VISIBLE_DEVICES
-    $BIN/llama-perplexity -m $BF16_FIRST -f $EVAL \
+    stdbuf -oL -eL $BIN/llama-perplexity -m $BF16_FIRST -f $EVAL \
         --kl-divergence-base $BASE -c $CTX -ngl 99 \
         2>&1 | tee /logs/base-$EVALSET.log
 
@@ -1324,7 +1367,7 @@ kld() {
     echo "KLD on $EVALSET: $NAME   (GPUs: $GPUS)"
     START=$(date +%s)
 
-    $BIN/llama-perplexity -m $1 -f $EVAL \
+    stdbuf -oL -eL $BIN/llama-perplexity -m $1 -f $EVAL \
         --kl-divergence-base $BASE --kl-divergence -c $CTX -ngl 99 \
         2>&1 | tee /logs/kld-$EVALSET--$NAME.log
 
@@ -1819,6 +1862,16 @@ push_corpus() {
 
 IM_CTX=512
 IM_BATCH=8192
+
+# --no-ppl skips the perplexity pass, which is a few percent faster. It also
+# removes the per-chunk line that was the only sign of progress, leaving a
+# forty minute run completely silent. Visibility is worth more than the few
+# percent, so it is off by default. Set IM_NO_PPL=1 to get it back.
+IM_NO_PPL=${IM_NO_PPL:-0}
+
+# How often llama-imatrix reports that it stored collected data. Also a
+# heartbeat.
+IM_OFREQ=20
 IM_CORPUS=/eval/calib_train.txt
 IM_MODEL=""
 
@@ -1931,7 +1984,7 @@ else:
     N=$2
     PER=$(( IM_CHUNKS / N + 1 ))
     FROM=$(( I * PER ))
-    OUT=/imatrix/shard-$I-of-$N.gguf
+    SHARD_OUT=/imatrix/shard-$I-of-$N.gguf
     mkdir -p /imatrix
 
     echo "node $I of $N: chunks $FROM onward"
@@ -1945,17 +1998,22 @@ else:
     date
     START=$(date +%s)
 
-    $BIN/llama-imatrix -m $IM_MODEL -f $IM_CORPUS -o $OUT \
+    PPLFLAG=""
+    [ "$IM_NO_PPL" = "1" ] && PPLFLAG="--no-ppl"
+
+    # stdbuf keeps the output line buffered. Without it the pipe into tee
+    # switches libc to 4 KB blocks and nothing appears for many minutes.
+    stdbuf -oL -eL $BIN/llama-imatrix -m $IM_MODEL -f $IM_CORPUS -o $SHARD_OUT \
         -ngl 99 -c $IM_CTX -b $IM_BATCH -ub $IM_BATCH \
-        --parse-special --no-ppl \
+        --parse-special $PPLFLAG --output-frequency $IM_OFREQ \
         --from-chunk $FROM $LIMIT \
         2>&1 | tee /logs/imatrix-shard-$I-of-$N.log
 
     echo "took $(( $(date +%s) - START )) seconds"
-    ls -lh $OUT
+    ls -lh $SHARD_OUT
     autopush /logs/imatrix-shard-$I-of-$N.log logs/imatrix-shard-$I-of-$N.log
-    if [ -f $OUT ]; then
-        hf upload $METRICS --repo-type $METRICS_KIND $OUT imatrix/shard-$I-of-$N.gguf \
+    if [ -f "$SHARD_OUT" ]; then
+        hf_put "$SHARD_OUT" "imatrix/shard-$I-of-$N.gguf" "$METRICS" "$METRICS_KIND" \
             && echo "  shard uploaded, the merging box can pick it up"
     fi
 }
@@ -1980,7 +2038,7 @@ im_range() {
     fi
     FROM=$1
     COUNT=$2
-    OUT=/imatrix/shard-$3.gguf
+    SHARD_OUT=/imatrix/shard-$3.gguf
     mkdir -p /imatrix
 
     if [ "$COUNT" = "0" ]; then
@@ -1993,17 +2051,20 @@ im_range() {
     date
     START=$(date +%s)
 
-    $BIN/llama-imatrix -m $IM_MODEL -f $IM_CORPUS -o $OUT \
+    PPLFLAG=""
+    [ "$IM_NO_PPL" = "1" ] && PPLFLAG="--no-ppl"
+
+    stdbuf -oL -eL $BIN/llama-imatrix -m $IM_MODEL -f $IM_CORPUS -o $SHARD_OUT \
         -ngl 99 -c $IM_CTX -b $IM_BATCH -ub $IM_BATCH \
-        --parse-special --no-ppl \
+        --parse-special $PPLFLAG --output-frequency $IM_OFREQ \
         --from-chunk $FROM $LIMIT \
         2>&1 | tee /logs/imatrix-shard-$3.log
 
     echo "took $(( $(date +%s) - START )) seconds"
-    ls -lh $OUT 2>/dev/null
+    ls -lh $SHARD_OUT 2>/dev/null
     autopush /logs/imatrix-shard-$3.log logs/imatrix-shard-$3.log
-    if [ -f "$OUT" ]; then
-        hf upload $METRICS --repo-type $METRICS_KIND $OUT imatrix/shard-$3.gguf \
+    if [ -f "$SHARD_OUT" ]; then
+        hf_put "$SHARD_OUT" "imatrix/shard-$3.gguf" "$METRICS" "$METRICS_KIND" \
             && echo "  shard uploaded"
     fi
 }
@@ -2035,7 +2096,7 @@ im_merge_all() {
         2>&1 | tee /logs/imatrix-stats.log | head -30
     autopush /logs/imatrix-merge.log logs/imatrix-merge.log
     autopush /logs/imatrix-stats.log logs/imatrix-stats.log
-    hf upload $METRICS --repo-type $METRICS_KIND /imatrix/imatrix.gguf imatrix/imatrix.gguf
+    hf_put /imatrix/imatrix.gguf imatrix/imatrix.gguf "$METRICS" "$METRICS_KIND"
 }
 
 im_merge() {
@@ -2077,7 +2138,7 @@ im_merge() {
 
     autopush /logs/imatrix-merge.log logs/imatrix-merge.log
     autopush /logs/imatrix-stats.log logs/imatrix-stats.log
-    hf upload $METRICS --repo-type $METRICS_KIND /imatrix/imatrix.gguf imatrix/imatrix.gguf
+    hf_put /imatrix/imatrix.gguf imatrix/imatrix.gguf "$METRICS" "$METRICS_KIND"
 }
 
 # Block until the corpus this build needs shows up in the dataset.
@@ -2281,7 +2342,7 @@ quantize() {
     shift 2
 
     STEM=$(basename $MAIN | sed "s/-GGUF//")
-    OUT=/gguf/$STEM-$LABEL.gguf
+    QUANT_OUT=/gguf/$STEM-$LABEL.gguf
 
     IM=""
     if [ -f /imatrix/imatrix.gguf ]; then
@@ -2292,18 +2353,18 @@ quantize() {
         ask "continue without calibration?" || return 1
     fi
 
-    echo "$BF16_FIRST  ->  $OUT   fallback $FTYPE"
+    echo "$BF16_FIRST  ->  $QUANT_OUT   fallback $FTYPE"
     date
     START=$(date +%s)
 
-    $BIN/llama-quantize $IM "$@" $BF16_FIRST $OUT $FTYPE $(nproc) \
+    stdbuf -oL -eL $BIN/llama-quantize $IM "$@" $BF16_FIRST $QUANT_OUT $FTYPE $(nproc) \
         2>&1 | tee /logs/quantize-$LABEL.log
 
     echo "took $(( $(date +%s) - START )) seconds"
-    ls -lh $OUT
+    ls -lh $QUANT_OUT
     autopush /logs/quantize-$LABEL.log logs/quantize-$LABEL.log
     echo
-    echo "publish it with:  push_model $OUT"
+    echo "publish it with:  push_model $QUANT_OUT"
 }
 
 # Pull somebody else's build so it can be measured against the same reference.
