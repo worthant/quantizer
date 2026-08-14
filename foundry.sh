@@ -16,6 +16,20 @@ BIN=/llama.cpp/build/bin
 STATE=/state.sh
 CTX=4096
 
+# Measurements from a previous model on the same box would be parsed into this
+# model's results and uploaded to its metrics repo. Wipe them when switching.
+clean_run() {
+    echo "about to remove measurements from any earlier model on this box:"
+    echo "  /logs      $(ls /logs 2>/dev/null | wc -l) files"
+    echo "  /kld       $(ls /kld 2>/dev/null | wc -l) files"
+    echo "  /imatrix   $(ls /imatrix 2>/dev/null | wc -l) files"
+    echo "the weights in /gguf and /src are left alone."
+    ask "remove?" || return 1
+    rm -rf /logs/* /kld/* /imatrix/*
+    mkdir -p /logs /kld /imatrix
+    echo "clean. Re-run cuda_check so env.txt exists again."
+}
+
 # Every log that says anything useful goes to the metrics repo the moment it
 # is written. Set AUTOPUSH=0 to keep things local while experimenting.
 AUTOPUSH=1
@@ -90,6 +104,18 @@ make_metrics() {
     repo_ok && echo "reachable now"
 }
 
+# Both repos for a release: the quants and the metrics beside them.
+make_repos() {
+    need_preset || return 1
+    token_check || return 1
+    echo "  $MAIN            (model)"
+    echo "  $METRICS   ($METRICS_KIND)"
+    ask "create both?" || return 1
+    hf repos create $MAIN --repo-type model 2>&1 | tail -1
+    hf repos create $METRICS --repo-type $METRICS_KIND 2>&1 | tail -1
+    repo_ok && echo "metrics repo reachable"
+}
+
 # Clone the calibration dataset with its pipeline. Large pool files live in
 # LFS, and a clone without git-lfs brings down pointer stubs instead of data,
 # which then fail to parse as JSON somewhere deep inside the build.
@@ -100,7 +126,10 @@ get_tools() {
 
     if [ -d /calib-corpora ]; then
         echo "already at /calib-corpora"
-        cd /calib-corpora && git pull && git lfs pull && cd - > /dev/null
+        cd /calib-corpora
+        git pull --ff-only 2>&1 || echo "local changes present, keeping them and skipping the pull"
+        git lfs pull
+        cd - > /dev/null
     else
         git clone https://huggingface.co/datasets/AtomicChat/calib-corpora /calib-corpora || return 1
         cd /calib-corpora && git lfs pull && cd - > /dev/null
@@ -1178,7 +1207,6 @@ build_corpus() {
         echo "date pinned to $PIN, so this build is reproducible"
     fi
 
-    cp /recipes/$NAME.yaml /calib-corpora/recipes/
     cd /calib-corpora
 
     check_pool || return 1
@@ -1189,7 +1217,8 @@ build_corpus() {
     echo "worthless here, so this is regenerated every time."
 
     BEFORE=$(git -C /calib-corpora status --porcelain pool/vocab_sweep | md5sum)
-    python3 tools/vocab_sweep.py --tokenizer /src/tokenizer.json 2>&1 | tee /logs/vocab-sweep-$NAME.log
+    python3 tools/vocab_sweep.py --tokenizer /src/tokenizer.json --name $NAME \
+        2>&1 | tee /logs/vocab-sweep-$NAME.log
 
     echo
     echo "what the sweep touched:"
@@ -1212,7 +1241,7 @@ build_corpus() {
     echo
     echo "=============== building the corpus ==============="
     date
-    python3 tools/build.py --recipe recipes/$NAME.yaml 2>&1 | tee /logs/build-$NAME.log
+    python3 tools/build.py --recipe /recipes/$NAME.yaml 2>&1 | tee /logs/build-$NAME.log
     date
 
     echo
@@ -1244,7 +1273,7 @@ push_corpus() {
     hf upload AtomicChat/calib-corpora --repo-type dataset \
         builds/$1 builds/$1
     hf upload AtomicChat/calib-corpora --repo-type dataset \
-        recipes/$1.yaml recipes/$1.yaml
+        /recipes/$1.yaml recipes/$1.yaml
     cd -
     echo "every box can now: get_calib $1"
 }
