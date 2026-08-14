@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.39
+FOUNDRY_VERSION=2026-08-14.40
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -219,7 +219,8 @@ selfcheck() {
              push_base push_logs push_results push_model push_model_split \
              push_card pull_logs get_imatrix get_calib wait_calib im_size \
              im_plan im_shard im_range im_merge im_merge_all im_stats \
-             im_status push_shards push_quants catch_up audit plan ls_main ls_metrics ls_corpora \
+             im_status push_shards push_quants catch_up audit del_model \
+             del_old_ad plan ls_main ls_metrics ls_corpora \
              get_recipe use_gpus apply_gpus list_repo fetch_one \
              write_kld_readme send_base get_base; do
         type -t $f > /dev/null 2>&1 || missing="$missing $f"
@@ -2834,59 +2835,61 @@ write_ladder() {
     cat > /ladder.txt << 'LADDEREOF'
 # Qwen3.8-27B. LABEL | FALLBACK | rules
 #
-# Every rung carries an edge boost, because it was measured rather than
-# assumed. At the same size class, on the same reference:
+# Built on a layout that was measured against six alternatives at the same size
+# class, all on the same bf16 reference:
 #
-#   uniform layers                    0.015799
-#   4 layers lifted                   0.014492
-#   16 layers lifted at both ends     0.009811
-#   16 lifted plus 8 more at the head 0.007427
+#   uniform layers                     0.015799 @ 16.81 GB
+#   4 layers lifted                    0.014492 @ 17.08
+#   16 lifted at both ends             0.009811 @ 17.82
+#   16 + 8 at the head                 0.007427 @ 18.63
+#   ... plus attn_gate up              0.008214 @ 18.39
+#   ... plus attn_gate and ssm_out up  0.007296 @ 18.55   <- this recipe
+#   wider edges instead                0.008263 @ 18.42
+#   output up instead                  0.007996 @ 18.78
 #
-# That is better than half the divergence for the same bits, just from where
-# they are spent. im_stats agrees: Sum(Act^2) for attn_gate peaks on layers 52
-# to 62 and again on layer 0, so importance really does sit at the ends, with
-# the tail hotter than the head.
+# What that says. Spending bits on the ends of the network rather than evenly
+# halves the divergence. attn_gate and ssm_out are worth a step each: im_stats
+# ranks attn_gate first in the whole model by Sum(Act^2), and this model is a
+# hybrid so ssm_out carries the recurrent path. token_embd is worth less than
+# its 4.7% suggests, since a lookup error stays local to one token, and paying
+# for it out of attn_q is a net gain. Widening the edge band further does not
+# pay, and neither does lifting the output head.
 #
-# The pattern per rung: blocks 0-3 and 52-63 get one step above the base type,
-# blocks 4-11 get the base type for gate and up as well as down, and the
-# middle of the network takes the rung's nominal layout.
-#
-# Everything else as before: ffn_down a step above gate and up, attn_k and
-# attn_v at q8_0 since they are 0.3% each, output high and token_embd low.
+# The pattern per rung, where D is the rung's base type:
+#   blocks 0-3 and 52-63 ffn   one step above D
+#   blocks 4-11 ffn            D
+#   ffn_down                   D, ffn_gate and ffn_up one step below
+#   attn_gate, ssm_out         one step above D
+#   attn_k, attn_v             q8_0 always, they are 0.3% each
+#   output                     high, token_embd low
 
 # ---- above 24 GB
 Q8_0             | q8_0 |
-AD-Q6_K          | q8_0 | ffn_down=q6_k ffn_gate=q6_k ffn_up=q6_k attn_q=q8_0 attn_gate=q6_k ssm_out=q8_0
+AD-Q6_K          | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q8_0 ffn_down=q6_k ffn_gate=q6_k ffn_up=q6_k attn_q=q6_k attn_gate=q8_0 ssm_out=q8_0
 
 # ---- 32 GB card
-AD-Q6_K-Q5_K     | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q8_0 ffn_down=q6_k ffn_gate=q5_k ffn_up=q5_k attn_q=q6_k attn_gate=q6_k ssm_out=q6_k
-AD-Q5_K          | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q6_k blk\.([4-9]|1[01])\.ffn_.*=q6_k ffn_down=q5_k ffn_gate=q5_k ffn_up=q5_k attn_q=q6_k attn_gate=q5_k ssm_out=q6_k
+AD-Q6_K-Q5_K     | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q8_0 blk\.([4-9]|1[01])\.ffn_.*=q6_k ffn_down=q6_k ffn_gate=q5_k ffn_up=q5_k attn_q=q5_k attn_gate=q8_0 ssm_out=q8_0 token_embd=q5_k
+AD-Q5_K          | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q6_k blk\.([4-9]|1[01])\.ffn_.*=q6_k ffn_down=q5_k ffn_gate=q5_k ffn_up=q5_k attn_q=q5_k attn_gate=q6_k ssm_out=q6_k output=q6_k token_embd=q4_k
 
 # ---- 24 GB card
-AD-Q5_K-Q4_K     | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q6_k blk\.([4-9]|1[01])\.ffn_.*=q5_k ffn_down=q5_k ffn_gate=q4_k ffn_up=q4_k attn_q=q5_k attn_gate=q5_k ssm_out=q5_k output=q6_k
-AD-Q4_K          | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q6_k blk\.([4-9]|1[01])\.ffn_.*=q5_k ffn_down=q5_k ffn_gate=q4_k ffn_up=q4_k attn_q=q5_k attn_gate=q5_k ssm_out=q5_k output=q6_k token_embd=q4_k
+AD-Q5_K-Q4_K     | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q6_k blk\.([4-9]|1[01])\.ffn_.*=q5_k ffn_down=q5_k ffn_gate=q4_k ffn_up=q4_k attn_q=q4_k attn_gate=q6_k ssm_out=q6_k output=q6_k token_embd=iq4_xs
+AD-Q4_K          | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q5_k blk\.([4-9]|1[01])\.ffn_.*=q5_k ffn_down=q4_k ffn_gate=q4_k ffn_up=q4_k attn_q=q4_k attn_gate=q5_k ssm_out=q5_k output=q6_k token_embd=iq4_xs
 
 # ---- 16 GB card
-AD-IQ4_XS        | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q5_k blk\.([4-9]|1[01])\.ffn_.*=q4_k ffn_down=q4_k ffn_gate=iq4_xs ffn_up=iq4_xs attn_q=q4_k attn_gate=q4_k ssm_out=q4_k output=q6_k token_embd=q4_k
-AD-IQ4_XS-IQ3_S  | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q4_k blk\.([4-9]|1[01])\.ffn_.*=iq4_xs ffn_down=iq4_xs ffn_gate=iq3_s ffn_up=iq3_s attn_q=q4_k attn_gate=iq4_xs ssm_out=iq4_xs output=q5_k token_embd=iq4_xs
+AD-IQ4_XS        | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q5_k blk\.([4-9]|1[01])\.ffn_.*=q4_k ffn_down=q4_k ffn_gate=iq4_xs ffn_up=iq4_xs attn_q=iq4_xs attn_gate=q5_k ssm_out=q5_k output=q6_k token_embd=iq4_xs
+AD-IQ4_XS-IQ3_S  | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q4_k blk\.([4-9]|1[01])\.ffn_.*=iq4_xs ffn_down=iq4_xs ffn_gate=iq3_s ffn_up=iq3_s attn_q=iq4_xs attn_gate=q4_k ssm_out=q4_k output=q5_k token_embd=iq4_xs
 AD-IQ3_S         | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq4_xs blk\.([4-9]|1[01])\.ffn_.*=iq4_xs ffn_down=iq3_s ffn_gate=iq3_s ffn_up=iq3_s attn_q=iq4_xs attn_gate=iq4_xs ssm_out=iq4_xs output=q5_k token_embd=iq4_xs
 
 # ---- 12 GB card
-AD-IQ3_S-IQ3_XXS | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq4_xs blk\.([4-9]|1[01])\.ffn_.*=iq3_s ffn_down=iq3_s ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq4_xs output=q5_k token_embd=iq4_xs
-AD-IQ3_XXS       | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq3_s blk\.([4-9]|1[01])\.ffn_.*=iq3_s ffn_down=iq3_xxs ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq4_xs
-AD-IQ2_S         | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq3_s blk\.([4-9]|1[01])\.ffn_.*=iq3_xxs ffn_down=iq2_s ffn_gate=iq2_s ffn_up=iq2_s attn_q=iq3_s attn_gate=iq3_s ssm_out=iq3_xxs output=q5_k token_embd=iq4_xs
+AD-IQ3_S-IQ3_XXS | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq4_xs blk\.([4-9]|1[01])\.ffn_.*=iq3_s ffn_down=iq3_s ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq3_s attn_gate=iq4_xs ssm_out=iq4_xs output=q5_k token_embd=iq4_xs
+AD-IQ3_XXS       | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq3_s blk\.([4-9]|1[01])\.ffn_.*=iq3_s ffn_down=iq3_xxs ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq3_s attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq4_xs
+AD-IQ2_S         | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq3_s blk\.([4-9]|1[01])\.ffn_.*=iq3_xxs ffn_down=iq2_s ffn_gate=iq2_s ffn_up=iq2_s attn_q=iq3_xxs attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq4_xs
 
 # ---- 8 to 10 GB
-AD-IQ2_S-IQ2_XS  | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq3_xxs blk\.([4-9]|1[01])\.ffn_.*=iq2_s ffn_down=iq2_s ffn_gate=iq2_xs ffn_up=iq2_xs attn_q=iq3_s attn_gate=iq3_xxs ssm_out=iq3_xxs output=q4_k token_embd=iq4_xs
-AD-IQ2_XS        | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq3_xxs blk\.([4-9]|1[01])\.ffn_.*=iq2_s ffn_down=iq2_xs ffn_gate=iq2_xs ffn_up=iq2_xs attn_q=iq3_xxs attn_gate=iq2_s ssm_out=iq3_xxs output=q4_k token_embd=iq4_xs
+AD-IQ2_S-IQ2_XS  | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq3_xxs blk\.([4-9]|1[01])\.ffn_.*=iq2_s ffn_down=iq2_s ffn_gate=iq2_xs ffn_up=iq2_xs attn_q=iq3_xxs attn_gate=iq3_xxs ssm_out=iq3_xxs output=q4_k token_embd=iq4_xs
+AD-IQ2_XS        | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq3_xxs blk\.([4-9]|1[01])\.ffn_.*=iq2_s ffn_down=iq2_xs ffn_gate=iq2_xs ffn_up=iq2_xs attn_q=iq2_s attn_gate=iq3_xxs ssm_out=iq3_xxs output=q4_k token_embd=iq4_xs
 AD-IQ2_XXS       | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq2_s blk\.([4-9]|1[01])\.ffn_.*=iq2_xs ffn_down=iq2_xxs ffn_gate=iq2_xxs ffn_up=iq2_xxs attn_q=iq2_s attn_gate=iq2_s ssm_out=iq2_s output=iq4_xs token_embd=iq4_xs
 AD-IQ1_M         | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq2_xs blk\.([4-9]|1[01])\.ffn_.*=iq2_xxs ffn_down=iq2_xxs ffn_gate=iq1_m ffn_up=iq1_m attn_q=iq2_s attn_gate=iq2_s ssm_out=iq2_s output=iq4_xs token_embd=iq4_xs
-AD-IQ1_S         | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq2_xs blk\.([4-9]|1[01])\.ffn_.*=iq2_xxs ffn_down=iq2_xxs ffn_gate=iq1_s ffn_up=iq1_s attn_q=iq2_s attn_gate=iq2_s ssm_out=iq2_s output=iq4_xs token_embd=iq4_xs
-
-# ---- stock mixes on the same imatrix, the baseline
-Q6_K             | q6_k |
-Q5_K_M           | q5_k_m |
-Q4_K_M           | q4_k_m |
 LADDEREOF
     echo "wrote /ladder.txt, $(grep -c '|' /ladder.txt) rungs"
     echo "check the sizes first:   ladder /ladder.txt --dry"
@@ -3305,6 +3308,46 @@ HAVEEOF
     echo
     echo "quants live in   $MAIN"
     echo "kld and logs in  $METRICS"
+}
+
+# Remove files from the model repo. The cli spells this differently between
+# versions, so it goes through the API like every other upload.
+del_model() {
+    need_preset || return 1
+    token_check > /dev/null || return 1
+    if [ -z "$1" ]; then
+        echo "del_model NAME [NAME ...]      names without the .gguf"
+        return 1
+    fi
+    python3 - "$MAIN" "$@" << 'DELEOF'
+import sys
+from huggingface_hub import HfApi
+api = HfApi()
+repo = sys.argv[1]
+for name in sys.argv[2:]:
+    path = name if name.endswith(".gguf") else name + ".gguf"
+    try:
+        api.delete_file(path_in_repo=path, repo_id=repo, repo_type="model")
+        print("deleted", path)
+    except Exception as e:
+        print("skip   %s: %s" % (path, str(e).splitlines()[0]))
+DELEOF
+}
+
+# Every AD file built before edge weighting was measured. They are superseded
+# by the same names built with it, and leaving both in the history means two
+# different layouts under one name.
+del_old_ad() {
+    del_model \
+        Qwen3.8-27B-AD-Q8_0 Qwen3.8-27B-AD-Q6_K Qwen3.8-27B-AD-Q6_K-Q5_K \
+        Qwen3.8-27B-AD-Q5_K Qwen3.8-27B-AD-Q5_K-Q4_K Qwen3.8-27B-AD-Q4_K \
+        Qwen3.8-27B-AD-Q4_K-IQ4_XS Qwen3.8-27B-AD-IQ4_XS \
+        Qwen3.8-27B-AD-IQ4_XS-IQ3_S Qwen3.8-27B-AD-IQ3_S \
+        Qwen3.8-27B-AD-IQ3_S-IQ3_XXS Qwen3.8-27B-AD-IQ3_XXS \
+        Qwen3.8-27B-AD-IQ3_XXS-IQ2_S Qwen3.8-27B-AD-IQ2_S \
+        Qwen3.8-27B-AD-IQ2_S-IQ2_XS Qwen3.8-27B-AD-IQ2_XS \
+        Qwen3.8-27B-AD-IQ2_XS-IQ2_XXS Qwen3.8-27B-AD-IQ2_XXS \
+        Qwen3.8-27B-AD-IQ2_XXS-IQ1_M Qwen3.8-27B-AD-IQ2_XXS-IQ1_S
 }
 
 push_model_split() {
