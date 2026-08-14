@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.20
+FOUNDRY_VERSION=2026-08-14.21
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -195,7 +195,7 @@ selfcheck() {
              new_model pick_model get_eval get_eval_set eval_size get_bf16 \
              get_quants get_one find_bf16 quant_files get_upstream make_bf16 \
              base kld kld_all bench bench_all gen results bits quantize \
-             get_external autopush push_base push_logs push_results push_model \
+             get_external kld_ext autopush push_base push_logs push_results push_model \
              pull_logs get_imatrix get_calib wait_calib im_size im_plan \
              im_shard im_range im_merge im_merge_all im_stats push_shards \
              im_status; do
@@ -270,6 +270,7 @@ QUANTIZE
   bits 'RULE' 'RULE'         predict the size before spending the time
   quantize LABEL TYPE ...    llama-quantize with the merged imatrix
   get_external REPO PATTERN  someone else's build, measured on our reference
+  kld_ext                    measure everything in /gguf/external on our base
 
 MEASURE
   get_eval / get_eval_set NAME / eval_size / set_ctx N
@@ -1391,6 +1392,26 @@ kld_all() {
         echo
         echo "########## $N of $TOTAL, roughly $(( (TOTAL - N) * 3 )) minutes left ##########"
         kld $f
+    done
+    results
+}
+
+# Measure other publishers' builds on OUR reference. Numbers taken against
+# different references cannot be put in the same table, so their published
+# figures are not usable directly, only their files are.
+kld_ext() {
+    local f n=0 total
+    total=$(ls /gguf/external/*.gguf 2>/dev/null | wc -l)
+    if [ "$total" = "0" ]; then
+        echo "nothing in /gguf/external. Pull some with:"
+        echo "  get_external unsloth/Qwen3.8-27B-GGUF '*UD-IQ3_XXS*'"
+        return 1
+    fi
+    for f in /gguf/external/*.gguf; do
+        n=$(( n + 1 ))
+        echo
+        echo "########## external $n of $total ##########"
+        kld "$f"
     done
     results
 }
