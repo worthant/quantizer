@@ -43,21 +43,38 @@ apply_gpus() {
     fi
 }
 
+token_check() {
+    if [ -z "$HF_TOKEN" ]; then
+        echo "HF_TOKEN is not set. export the real one, then retry."
+        return 1
+    fi
+    case "$HF_TOKEN" in
+        PUT_*|hf_xxx*|CHANGE*)
+            echo "HF_TOKEN is still a placeholder: $HF_TOKEN"
+            echo "This file must never export a token. export it in your shell."
+            return 1 ;;
+    esac
+    hf auth whoami
+}
+
 repo_ok() {
     if [ -z "$METRICS" ]; then
         echo "no preset loaded"
         return 1
     fi
-    if hf repo info $METRICS --repo-type $METRICS_KIND > /dev/null 2>&1; then
+    if python3 -c "
+import sys
+from huggingface_hub import HfApi
+sys.exit(0 if HfApi().repo_exists(sys.argv[1], repo_type=sys.argv[2]) else 1)
+" "$METRICS" "$METRICS_KIND" 2>/dev/null; then
         return 0
     fi
     echo
-    echo "The metrics repo does not exist, or your token cannot see it:"
-    echo "  $METRICS   (type: $METRICS_KIND)"
+    echo "cannot see $METRICS as a $METRICS_KIND"
     echo
-    echo "Create it with:   make_metrics"
-    echo "Or, if it exists as a model repo rather than a dataset, flip the type:"
-    echo "  METRICS_KIND=model ; save_state"
+    echo "check the token first:   token_check"
+    echo "if the token is fine, create the repo:   make_metrics"
+    echo "if it exists as a model repo:   METRICS_KIND=model ; save_state"
     return 1
 }
 
@@ -66,10 +83,23 @@ make_metrics() {
         echo "no preset loaded"
         return 1
     fi
+    token_check || return 1
     echo "creating $METRICS as a $METRICS_KIND"
     ask "create?" || return 1
-    hf repo create $METRICS --repo-type $METRICS_KIND
-    hf repo info $METRICS --repo-type $METRICS_KIND && echo "exists now"
+    hf repos create $METRICS --repo-type $METRICS_KIND
+    repo_ok && echo "reachable now"
+}
+
+# Clone the calibration dataset with its pipeline, so corpora can be built here.
+get_tools() {
+    if [ -d /calib-corpora ]; then
+        echo "already at /calib-corpora"
+        cd /calib-corpora && git pull && cd -
+        return 0
+    fi
+    token_check || return 1
+    git clone https://huggingface.co/datasets/AtomicChat/calib-corpora /calib-corpora
+    ls /calib-corpora/tools /calib-corpora/recipes
 }
 
 autopush() {
@@ -360,8 +390,10 @@ RESULTS
   results                    parse all logs into /logs/results.json
 
 UPLOAD, one job each
+  token_check                is HF_TOKEN real and does the hub accept it
   make_metrics               create the metrics repo if it does not exist
   repo_ok                    check the metrics repo is reachable
+  get_tools                  clone calib-corpora with recipes and pipeline
   push_base                  reference logits, hash, README, logs -> metrics
                              splits into 45 GB parts when over the limit
   send_base user@host PORT   ship the reference straight to another box
