@@ -10,51 +10,39 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.24
+FOUNDRY_VERSION=2026-08-14.27
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
 
-# raw.githubusercontent.com is served through a CDN that caches for minutes, so
-# a plain curl right after a push returns 200 with the previous file. The API
-# endpoint reads the repository directly and is not cached that way.
-#
-# This function cannot honestly report its own result either: by the time the
-# new file is sourced, any message it prints still comes from the copy that was
-# already running. So it inspects the download BEFORE replacing anything.
+# Both http paths to github are cached: raw.githubusercontent behind a CDN, and
+# the contents API behind its own layer. Either can serve a file that is minutes
+# old, and reload then reports success on a copy that has not changed. git does
+# not go through any of that, so a clone is the only version of this that can be
+# trusted, and it can also show which commit it is actually on.
 reload() {
-    TMP=/tmp/foundry.new
-    curl -sL -H "Accept: application/vnd.github.raw" \
-        https://api.github.com/repos/worthant/quantizer/contents/foundry.sh \
-        -o $TMP || { echo "download failed, keeping the current copy"; return 1; }
-
-    if ! head -1 $TMP | grep -q "^#!"; then
-        echo "what came back is not a script:"
-        head -3 $TMP
-        return 1
+    if [ -d /quantizer/.git ]; then
+        git -C /quantizer fetch -q origin && git -C /quantizer reset -q --hard origin/HEAD || return 1
+    else
+        rm -rf /quantizer
+        git clone -q https://github.com/worthant/quantizer /quantizer || return 1
     fi
 
-    GOT=$(grep -m1 "^FOUNDRY_VERSION=" $TMP | cut -d= -f2)
-    echo "here: ${FOUNDRY_VERSION:-unknown}    on github: ${GOT:-none}"
+    echo "commit: $(git -C /quantizer log -1 --format='%h %ad %s' --date=short)"
+    local got
+    got=$(grep -m1 "^FOUNDRY_VERSION=" /quantizer/foundry.sh | cut -d= -f2)
+    echo "here: ${FOUNDRY_VERSION:-unknown}    at that commit: ${got:-none}"
 
-    if [ -z "$GOT" ]; then
-        echo "the copy on github has no version line, so it is older than this."
-        echo "your push has not landed at main/foundry.sh."
-        return 1
-    fi
-    if [ "$GOT" = "$FOUNDRY_VERSION" ]; then
-        echo "same version, nothing to do"
+    if [ "$got" = "$FOUNDRY_VERSION" ]; then
+        echo "same version. That commit above is what is on the remote, so if it"
+        echo "is not what you pushed, the push did not land on the default branch."
         return 0
     fi
-
-    mv $TMP /foundry.sh
+    cp /quantizer/foundry.sh /foundry.sh
     source /foundry.sh
     echo "now running $FOUNDRY_VERSION"
 }
 
-BIN=/llama.cpp/build/bin
-STATE=/state.sh
-CTX=4096
 
 # ------------------------------------------------------------------ basics
 # Bash functions live in one shell process, so a new tmux pane knows nothing.
@@ -86,59 +74,27 @@ persist_shell() {
     echo "Added to ~/.bashrc. Every new tmux pane now loads this by itself."
 }
 
-# Never guess a repo id.
-find_repo() {
-    if [ -z "$1" ]; then
-        echo "find_repo QUERY        e.g. find_repo Qwen3.8"
+save_token() {
+    if [ -z "$HF_TOKEN" ]; then
+        echo "export HF_TOKEN first, then run this"
         return 1
     fi
-    python3 - "$1" << 'FINDEOF'
-import sys
-from huggingface_hub import HfApi
-q = sys.argv[1]
-try:
-    hits = list(HfApi().list_models(search=q, sort="downloads", direction=-1, limit=40))
-except Exception as e:
-    print("search failed: %s" % e)
-    sys.exit(1)
-if not hits:
-    print("nothing on the hub matches %r" % q)
-    sys.exit(1)
-print("%-52s %12s  %s" % ("repo id", "downloads", "updated"))
-for m in hits:
-    print("%-52s %12s  %s" % (m.id, m.downloads or 0,
-                              str(getattr(m, "lastModified", ""))[:10]))
-print()
-print("original weights live under the vendor org, not in a GGUF repo.")
-FINDEOF
+    grep -q "export HF_TOKEN=" ~/.bashrc 2>/dev/null \
+        && sed -i "s|export HF_TOKEN=.*|export HF_TOKEN=$HF_TOKEN|" ~/.bashrc \
+        || echo "export HF_TOKEN=$HF_TOKEN" >> ~/.bashrc
+    echo "stored in ~/.bashrc, every new pane will have it"
+    echo "this box is disposable, the token is not: revoke it when you are done"
 }
 
-# The single definition of "a file we measure". Everything else in /gguf is a
-# reference, a drafter, or the imatrix, and none of those are quants.
-INCLUDE_EXPERIMENTAL=${INCLUDE_EXPERIMENTAL:-0}
-
-quant_files() {
-    if [ "$INCLUDE_EXPERIMENTAL" = "1" ]; then
-        DEPTH=2
-    else
-        DEPTH=1
-    fi
-    find /gguf -maxdepth $DEPTH -name "*.gguf" 2>/dev/null \
-        | grep -v -i "bf16" \
-        | grep -v "/dflash-" \
-        | grep -v "/dspark-" \
-        | grep -v -i "imatrix" \
-        | sort
-}
-
-# Uses the python API rather than the cli. The cli's argument order changed
-# between huggingface_hub versions, and boxes rented at different times do not
-# have the same one, so the same command worked on one and failed on another.
-#
-# Every local is declared. This function used to assign a bare OUT, which is
-# the same global the caller uses for its output path, so the caller's path
-# was replaced by an error message and the next test on it broke.
+# The cli's argument order changed between huggingface_hub versions and boxes
+# rented at different times do not have the same one, so uploads go through the
+# python API instead.
 hf_put() {
+    if [ -z "$HF_TOKEN" ] && [ ! -f ~/.cache/huggingface/token ]; then
+        echo "no token in this shell. A new tmux pane does not inherit it."
+        echo "  export HF_TOKEN=<yours>      and to stop repeating it:  save_token"
+        return 1
+    fi
     python3 - "$1" "$2" "$3" "$4" << 'PUTEOF'
 import sys
 from huggingface_hub import HfApi
@@ -174,18 +130,54 @@ except Exception as e:
 PUTDEOF
 }
 
-# These boxes are rented and ephemeral, so keeping the token in the shell
-# profile is a fair trade for not losing an upload in every new pane.
-save_token() {
-    if [ -z "$HF_TOKEN" ]; then
-        echo "export HF_TOKEN first, then run this"
+# Never guess a repo id.
+find_repo() {
+    if [ -z "$1" ]; then
+        echo "find_repo QUERY        e.g. find_repo Qwen3.8"
         return 1
     fi
-    grep -q "export HF_TOKEN=" ~/.bashrc 2>/dev/null \
-        && sed -i "s|export HF_TOKEN=.*|export HF_TOKEN=$HF_TOKEN|" ~/.bashrc \
-        || echo "export HF_TOKEN=$HF_TOKEN" >> ~/.bashrc
-    echo "stored in ~/.bashrc, every new pane will have it"
-    echo "this box is disposable, but the token is not: revoke it when you are done"
+    python3 - "$1" << 'FINDEOF'
+import sys
+from huggingface_hub import HfApi
+q = sys.argv[1]
+try:
+    hits = list(HfApi().list_models(search=q, sort="downloads", direction=-1, limit=40))
+except Exception as e:
+    print("search failed: %s" % e)
+    sys.exit(1)
+if not hits:
+    print("nothing on the hub matches %r" % q)
+    sys.exit(1)
+print("%-52s %12s  %s" % ("repo id", "downloads", "updated"))
+for m in hits:
+    print("%-52s %12s  %s" % (m.id, m.downloads or 0,
+                              str(getattr(m, "lastModified", ""))[:10]))
+FINDEOF
+}
+
+# Boxes get reused across models and the previous one's weights are still on
+# disk, so anything that picks a file filters by this stem.
+model_stem() {
+    [ -n "$MAIN" ] && basename "$MAIN" | sed "s/-GGUF$//"
+}
+
+INCLUDE_EXPERIMENTAL=${INCLUDE_EXPERIMENTAL:-0}
+
+quant_files() {
+    if [ "$INCLUDE_EXPERIMENTAL" = "1" ]; then
+        DEPTH=2
+    else
+        DEPTH=1
+    fi
+    local stem
+    stem=$(model_stem)
+    find /gguf -maxdepth $DEPTH -name "*.gguf" 2>/dev/null \
+        | grep -v -i "bf16" \
+        | grep -v "/dflash-" \
+        | grep -v "/dspark-" \
+        | grep -v -i "imatrix" \
+        | { [ -n "$stem" ] && grep -F "$stem" || cat; } \
+        | sort
 }
 
 autopush() {
@@ -201,33 +193,6 @@ autopush() {
     fi
 }
 
-# Every function this file advertises has to exist. Editing a big shell file by
-# cutting between two function names quietly eats whatever sat between them,
-# and the symptom is a command not found long after the damage.
-selfcheck() {
-    MISSING=""
-    for f in save_state persist_shell save_token hf_put reload find_repo use_model show_preset \
-             check repo_ok token_check make_metrics make_repos clean_run \
-             setup build gpu_test get_tools check_pool fix_pool install_auto_fmt \
-             setup_corpus build_corpus push_corpus corpus_check make_recipe \
-             new_model pick_model get_eval get_eval_set eval_size get_bf16 \
-             get_quants get_one find_bf16 quant_files get_upstream make_bf16 \
-             base kld kld_all bench bench_all gen results bits quantize \
-             get_external kld_ext ladder autopush push_base push_logs push_results push_model \
-             pull_logs get_imatrix get_calib wait_calib im_size im_plan \
-             im_shard im_range im_merge im_merge_all im_stats push_shards \
-             im_status hf_put_dir; do
-        type -t $f > /dev/null 2>&1 || MISSING="$MISSING $f"
-    done
-    if [ -n "$MISSING" ]; then
-        echo "MISSING functions:$MISSING"
-        echo "the file on disk is incomplete. Pull it again."
-        return 1
-    fi
-    echo "all functions present, version $FOUNDRY_VERSION"
-}
-
-
 setup_convert() {
     echo "This installs torch and friends so convert_hf_to_gguf.py can run."
     echo "Around 3 GB of downloads. Only needed when we have to BUILD a bf16 gguf."
@@ -236,73 +201,72 @@ setup_convert() {
     echo "done. If the converter complains about RoPE, pin transformers below 5."
 }
 
+# Every function this file advertises has to exist. Editing a big shell file by
+# cutting between two function names quietly eats whatever sat between them.
+selfcheck() {
+    local f missing=""
+    for f in save_state persist_shell save_token hf_put hf_put_dir reload \
+             find_repo selfcheck model_stem quant_files autopush use_nemotron \
+             use_qwen use_model show_preset need_preset ask mark status menu \
+             help_me use_evalset set_ctx check cuda_check fix_cuda_compat \
+             clean_run clean_gguf repo_ok token_check make_metrics make_repos \
+             setup setup_convert build gpu_test get_tools check_pool fix_pool \
+             install_auto_fmt setup_corpus build_corpus push_corpus \
+             corpus_check make_recipe new_model pick_model get_eval \
+             get_eval_set eval_size get_bf16 get_quants get_one find_bf16 \
+             get_upstream make_bf16 base kld kld_all kld_ext bench bench_all \
+             gen results bits quantize ladder write_ladder get_external \
+             push_base push_logs push_results push_model push_model_split \
+             push_card pull_logs get_imatrix get_calib wait_calib im_size \
+             im_plan im_shard im_range im_merge im_merge_all im_stats \
+             im_status push_shards plan ls_main ls_metrics ls_corpora \
+             get_recipe use_gpus apply_gpus list_repo fetch_one \
+             write_kld_readme send_base get_base; do
+        type -t $f > /dev/null 2>&1 || missing="$missing $f"
+    done
+    if [ -n "$missing" ]; then
+        echo "MISSING functions:$missing"
+        echo "the file on disk is incomplete. Pull it again."
+        return 1
+    fi
+    echo "all functions present, version $FOUNDRY_VERSION"
+}
+
 help_me() {
 cat << 'HELP_EOF'
 
-PRESET
-  use_model NAME REPO        any model, verified against the hub
-  use_nemotron / use_qwen    shortcuts
-  find_repo QUERY            search the hub so a repo id is never guessed
-  show_preset / plan / status / menu / selfcheck
+ORIENTATION   status | plan | menu | selfcheck | help_me | reload
 
-BOX SETUP
-  check / cuda_check / fix_cuda_compat
-  setup                      apt and the hugging face cli
-  build 120                  compile. 120 blackwell, 90 hopper, 89 ada, 86 ampere
-  gpu_test                   does ggml actually see the GPUs
-  persist_shell              auto-source this in every new tmux pane
-  save_token                 keep HF_TOKEN in ~/.bashrc on this box
-  clean_run                  wipe logs, kld and imatrix from a previous model
+PRESET        use_model NAME REPO | use_nemotron | use_qwen | find_repo QUERY
 
-REPOS
-  token_check / repo_ok / make_metrics / make_repos
-  ls_main / ls_metrics / ls_corpora
+BOX SETUP     check | cuda_check | setup | build 120 | gpu_test
+              persist_shell | save_token | clean_run | clean_gguf
 
-A MODEL WE HAVE NEVER QUANTIZED
-  new_model NAME REPO        template check plus a filled in recipe
-  make_recipe NAME REPO      just the recipe, read from the hub
-  corpus_check DIR_OR_REPO   which tool call shape the template accepts, and
-                             which markers are real special tokens
-  get_upstream / setup_convert / make_bf16
+REPOS         token_check | repo_ok | make_repos | ls_main | ls_metrics
 
-CORPUS
-  get_tools / check_pool / fix_pool / install_auto_fmt / setup_corpus
-  build_corpus NAME          vocab sweep for this tokenizer, then the corpus
-  push_corpus NAME           publish the build and the recipe
-  get_calib NAME / wait_calib NAME
+NEW MODEL     new_model NAME REPO | make_recipe NAME REPO | corpus_check REPO
+              get_upstream | setup_convert | make_bf16
 
-IMATRIX, split across as many boxes as you like
-  pick_model                 choose IM_MODEL, bf16 first
-  IM_TOKENS_EXACT=N          real token count, so shards come out even
-  IM_BATCH=4096              lower it when the vocabulary is large
-  IM_NO_PPL=1                skip perplexity, a few percent faster but the run
-                             then prints nothing for its whole duration
-  IM_OFREQ=20                how often it reports, doubles as a heartbeat
-  im_size / im_plan N
-  im_shard I N               node I of N, 0 based
-  im_range FROM COUNT LABEL  explicit range, for rebalancing a slow box
-  im_merge N / im_merge_all / im_stats FILE / get_imatrix
+CORPUS        get_tools | check_pool | fix_pool | install_auto_fmt
+              setup_corpus | build_corpus NAME | push_corpus NAME
+              get_calib NAME | wait_calib NAME | ls_corpora | get_recipe NAME
 
-QUANTIZE
-  bits                       what each tensor group weighs, and its divisibility
-  bits 'RULE' 'RULE'         predict the size before spending the time
-  quantize LABEL TYPE ...    llama-quantize with the merged imatrix
-  ladder FILE                quantize, measure and publish every rung in a file
-  ladder FILE --dry          only predict the sizes, run this first
-  get_external REPO PATTERN  someone else's build, measured on our reference
-  kld_ext                    measure everything in /gguf/external on our base
+IMATRIX       pick_model | im_size | im_plan N | im_shard I N
+              im_range FROM COUNT LABEL | im_merge_all | im_status
+              push_shards | get_imatrix | im_stats FILE
+              IM_TOKENS_EXACT=N  IM_BATCH=4096  IM_SKIP="name"  IM_NO_PPL=1
 
-MEASURE
-  get_eval / get_eval_set NAME / eval_size / set_ctx N
-  base                       write the reference from bf16
-  use_gpus 0,1               how many GPUs the quant runs may use
-  kld MODEL / kld_all / bench MODEL / bench_all / gen MODEL NGL "EXTRA"
-  results / pull_logs
+QUANTIZE      bits | bits 'RULE' 'RULE' | quantize LABEL TYPE ...
+              write_ladder | ladder /ladder.txt --dry | ladder /ladder.txt
+              get_external REPO PATTERN
 
-UPLOAD
-  push_base / push_logs / push_results
-  push_model FILE / push_model_split FILE / push_card FILE
-  send_base user@host PORT
+MEASURE       get_eval | get_eval_set NAME | eval_size | set_ctx N | base
+              use_gpus 0,1 | kld MODEL | kld_all | kld_ext
+              bench MODEL | bench_all | gen MODEL NGL "EXTRA"
+              results | pull_logs
+
+UPLOAD        push_base | push_logs | push_results | push_model FILE
+              push_model_split FILE | push_card FILE | send_base user@host PORT
 
 HELP_EOF
 }
@@ -572,6 +536,27 @@ clean_run() {
     rm -rf /logs/* /kld/* /imatrix/*
     mkdir -p /logs /kld /imatrix
     echo "clean. Re-run cuda_check so env.txt exists again."
+}
+
+# Weights from an earlier model on this box. They are large and they confuse
+# every file picker, so this offers to remove exactly those.
+clean_gguf() {
+    need_preset || return 1
+    local stem others
+    stem=$(model_stem)
+    others=$(find /gguf /src -maxdepth 2 -name "*.gguf" 2>/dev/null | grep -v -F "$stem")
+    if [ -z "$others" ]; then
+        echo "nothing here belongs to another model"
+        return 0
+    fi
+    echo "not part of $stem:"
+    echo "$others" | xargs -r du -sh 2>/dev/null | sed "s/^/  /"
+    echo
+    du -sh /gguf
+    ask "delete them?" || return 1
+    echo "$others" | xargs -r rm -f
+    find /gguf -type d -empty -delete
+    du -sh /gguf
 }
 
 # Every log that says anything useful goes to the metrics repo the moment it
@@ -1113,13 +1098,30 @@ set_ctx() {
 }
 
 find_bf16() {
-    ALL=$(find /gguf -name "*.gguf" 2>/dev/null | grep -i bf16 | grep -v "/dflash-" | grep -v "/dspark-")
-    FOUND=$(echo "$ALL" | grep "00001-of-" | head -1)
+    local stem all
+    stem=$(model_stem)
+    all=$(find /gguf -name "*.gguf" 2>/dev/null | grep -i bf16 \
+          | grep -v "/dflash-" | grep -v "/dspark-")
+
+    if [ -n "$stem" ]; then
+        local mine
+        mine=$(echo "$all" | grep -F "$stem")
+        if [ -z "$mine" ] && [ -n "$all" ]; then
+            echo "there are bf16 files here, but none belongs to $stem:"
+            echo "$all" | sed "s/^/   /"
+            echo "this box was used for another model. Run get_bf16, or"
+            echo "make_bf16, or free the disk with clean_gguf."
+            return 1
+        fi
+        all=$mine
+    fi
+
+    FOUND=$(echo "$all" | grep "00001-of-" | head -1)
     if [ -z "$FOUND" ]; then
-        FOUND=$(echo "$ALL" | head -1)
+        FOUND=$(echo "$all" | head -1)
     fi
     if [ -z "$FOUND" ]; then
-        echo "no bf16 in /gguf. Run get_bf16."
+        echo "no bf16 for $stem in /gguf. Run get_bf16 or make_bf16."
         return 1
     fi
     BF16_FIRST=$FOUND
@@ -2344,7 +2346,10 @@ BLIND = {"q2_0", "mxfp4", "nvfp4", "q8_0", "f16", "bf16", "f32", "q1_0"}
 reader = GGUFReader(path)
 
 def group_of(name):
-    for key in ("ffn_down_exps", "ffn_up_exps", "ffn_gate_exps",
+    for key in ("attn_gate", "ssm_out", "ssm_in", "ssm_conv1d", "ssm_norm",
+                "ssm_alpha", "ssm_beta", "ssm_dt", "ssm_a", "ssm_d",
+                "nextn", "post_attention_norm",
+                "ffn_down_exps", "ffn_up_exps", "ffn_gate_exps",
                 "ffn_down_shexp", "ffn_up_shexp", "ffn_gate_shexp",
                 "ffn_down", "ffn_up", "ffn_gate", "ffn_gate_inp",
                 "attn_q", "attn_k", "attn_v", "attn_output", "attn_norm",
@@ -2523,14 +2528,28 @@ ladder() {
     need_preset || return 1
     find_bf16 || return 1
 
-    local line label fallback rules args r dry=""
+    local line label fallback rules args r dry="" bad=0
     [ "$2" = "--dry" ] && dry=1
 
     while IFS= read -r line; do
         case "$line" in ""|\#*) continue ;; esac
+
+        # A rung is LABEL | FALLBACK | rules. Anything else is not one: a
+        # failed download leaves an html or json error page behind, and every
+        # line of it would otherwise be treated as a quantization to run.
+        if [ "$(echo "$line" | tr -cd '|' | wc -c)" -lt 2 ]; then
+            echo "not a rung, skipping: $line"
+            bad=$(( bad + 1 ))
+            continue
+        fi
         label=$(echo "$line" | cut -d'|' -f1 | tr -d ' ')
         fallback=$(echo "$line" | cut -d'|' -f2 | tr -d ' ')
         rules=$(echo "$line" | cut -d'|' -f3-)
+        case "$label" in
+            *[!A-Za-z0-9_.-]*|"")
+                echo "label is not usable, skipping: $label"
+                bad=$(( bad + 1 )); continue ;;
+        esac
 
         echo
         echo "=================================================="
@@ -2557,7 +2576,63 @@ ladder() {
         push_model "$out"
     done < "$1"
 
+    if [ "$bad" -gt 0 ]; then
+        echo
+        echo "$bad line(s) were not rungs. If the whole file looked wrong, it is"
+        echo "probably an error page from a failed download. Rewrite it with:"
+        echo "  write_ladder"
+    fi
     results
+}
+
+# The ladder lives here rather than in a separate file, so a failed download
+# can never leave a json error page standing in for it.
+write_ladder() {
+    cat > /ladder.txt << 'LADDEREOF'
+# Qwen3.8-27B. LABEL | FALLBACK | rules
+#
+# ffn_down, ffn_gate and ffn_up are 21.2% each, 63.6% together, so they set the
+# size. down carries more of the quality and sits one step above the other two
+# at every rung; a preset gives all three the same type, and that asymmetry is
+# where these win at equal size.
+#
+# attn_gate and ssm_out are 5.5% each. This model is a hybrid and those two are
+# 11% together, so leaving them at q8_0 costs 3.2 GB in every file.
+#
+# attn_k and attn_v are 0.3% each: kept at q8_0 everywhere, it is free.
+#
+# output and token_embd weigh the same, 4.7%. The head decides the next token
+# and stays high; the embedding table is a lookup whose error stays local to
+# one token, so it drops fast at the bottom.
+
+Q8_0        | q8_0 |
+AD-Q6       | q8_0 | ffn_down=q6_k ffn_gate=q6_k ffn_up=q6_k attn_q=q8_0 attn_gate=q6_k ssm_out=q8_0
+AD-Q5_XL    | q8_0 | ffn_down=q6_k ffn_gate=q5_k ffn_up=q5_k attn_q=q6_k attn_gate=q5_k ssm_out=q6_k
+AD-Q5       | q8_0 | ffn_down=q5_k ffn_gate=q5_k ffn_up=q5_k attn_q=q5_k attn_gate=q5_k ssm_out=q6_k
+AD-Q4_XL    | q8_0 | ffn_down=q5_k ffn_gate=q4_k ffn_up=q4_k attn_q=q5_k attn_gate=q4_k ssm_out=q5_k output=q6_k
+AD-IQ4      | q8_0 | ffn_down=q4_k ffn_gate=iq4_xs ffn_up=iq4_xs attn_q=iq4_xs attn_gate=iq4_xs ssm_out=q5_k output=q6_k token_embd=q5_k
+AD-IQ3_XL   | q8_0 | ffn_down=iq4_xs ffn_gate=iq3_s ffn_up=iq3_s attn_q=iq4_xs attn_gate=iq4_xs ssm_out=iq4_xs output=q5_k token_embd=q4_k
+AD-IQ3      | q8_0 | ffn_down=iq3_s ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq4_xs output=q5_k token_embd=iq4_xs
+AD-IQ2_XL   | q8_0 | ffn_down=iq3_xxs ffn_gate=iq2_m ffn_up=iq2_m attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq3_xxs
+AD-IQ2      | q8_0 | ffn_down=iq2_m ffn_gate=iq2_s ffn_up=iq2_s attn_q=iq3_s attn_gate=iq3_xxs ssm_out=iq3_xxs output=q4_k token_embd=iq3_xxs
+AD-IQ2_S    | q8_0 | ffn_down=iq2_s ffn_gate=iq2_xxs ffn_up=iq2_xxs attn_q=iq3_xxs attn_gate=iq2_m ssm_out=iq3_xxs output=q4_k token_embd=iq2_xxs
+AD-IQ1_M    | q8_0 | ffn_down=iq2_xxs ffn_gate=iq1_m ffn_up=iq1_m attn_q=iq3_xxs attn_gate=iq2_s ssm_out=iq2_m output=iq4_xs token_embd=iq2_xxs
+AD-IQ1_S    | q8_0 | ffn_down=iq2_xxs ffn_gate=iq1_s ffn_up=iq1_s attn_q=iq2_m attn_gate=iq2_s ssm_out=iq2_m output=iq4_xs token_embd=iq2_xxs
+
+# The stock presets, as the baseline. Without them "better than the preset at
+# the same size" has nothing to stand on.
+Q6_K        | q6_k |
+Q5_K_M      | q5_k_m |
+Q4_K_M      | q4_k_m |
+IQ4_XS      | iq4_xs |
+IQ3_M       | iq3_m |
+IQ3_XXS     | iq3_xxs |
+IQ2_M       | iq2_m |
+IQ2_XXS     | iq2_xxs |
+IQ1_M       | iq1_m |
+LADDEREOF
+    echo "wrote /ladder.txt, $(grep -c '|' /ladder.txt) rungs"
+    echo "check the sizes first:   ladder /ladder.txt --dry"
 }
 
 # Pull somebody else's build so it can be measured against the same reference.
