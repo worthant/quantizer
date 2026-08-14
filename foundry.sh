@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.31
+FOUNDRY_VERSION=2026-08-14.33
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -219,7 +219,7 @@ selfcheck() {
              push_base push_logs push_results push_model push_model_split \
              push_card pull_logs get_imatrix get_calib wait_calib im_size \
              im_plan im_shard im_range im_merge im_merge_all im_stats \
-             im_status push_shards push_quants plan ls_main ls_metrics ls_corpora \
+             im_status push_shards push_quants catch_up plan ls_main ls_metrics ls_corpora \
              get_recipe use_gpus apply_gpus list_repo fetch_one \
              write_kld_readme send_base get_base; do
         type -t $f > /dev/null 2>&1 || missing="$missing $f"
@@ -1399,6 +1399,8 @@ kld() {
     autopush /logs/kld-$EVALSET--$NAME.log logs/kld-$EVALSET--$NAME.log
 }
 
+# Skips anything already measured, so it is the catch up command after a box
+# built quants before its reference existed. KLD_FORCE=1 redoes them.
 kld_all() {
     FILES=$(quant_files)
     if [ -z "$FILES" ]; then
@@ -1407,15 +1409,44 @@ kld_all() {
         find /gguf -name "*.gguf" | sed "s/^/   /"
         return 1
     fi
-    TOTAL=$(echo "$FILES" | wc -l)
-    N=0
+    local todo="" f name
     for f in $FILES; do
+        name=$(basename "$f" .gguf)
+        if [ -f "/logs/kld-$EVALSET--$name.log" ] && [ "$KLD_FORCE" != "1" ]; then
+            echo "already measured, skipping: $name"
+            continue
+        fi
+        todo="$todo $f"
+    done
+    if [ -z "$todo" ]; then
+        echo "everything here is measured. KLD_FORCE=1 kld_all to redo."
+        results
+        return 0
+    fi
+
+    TOTAL=$(echo $todo | wc -w)
+    N=0
+    for f in $todo; do
         N=$(( N + 1 ))
         echo
         echo "########## $N of $TOTAL, roughly $(( (TOTAL - N) * 3 )) minutes left ##########"
         kld $f
     done
     results
+}
+
+# Everything a box needs after it has built quants: a reference if it has none,
+# then measure whatever is not measured, then publish.
+catch_up() {
+    need_preset || return 1
+    if [ ! -f "$BASE" ]; then
+        echo "no reference on this box, building one. Two minutes."
+        get_eval || return 1
+        base || return 1
+    fi
+    kld_all
+    push_quants
+    push_logs
 }
 
 # Measure other publishers' builds on OUR reference. Numbers taken against
@@ -2544,10 +2575,9 @@ ladder_part() {
         echo "  ladder_part 2 4     second quarter of the ladder"
         return 1
     fi
-    if [ ! -f /ladder.txt ]; then
-        echo "no /ladder.txt. Run write_ladder."
-        return 1
-    fi
+    # Always regenerate first. A slice cut before an update is the single most
+    # common way to spend an hour quantizing rungs that were already fixed.
+    write_ladder > /dev/null
     grep -v "^#" /ladder.txt | grep "|" > /tmp/rungs.txt
     local total per from
     total=$(wc -l < /tmp/rungs.txt)
@@ -3025,7 +3055,12 @@ push_logs() {
     need_preset || return 1
     repo_ok || return 1
     du -sh /logs
-    hf_put_dir /logs logs "$METRICS" "$METRICS_KIND"
+    if hf_put_dir /logs logs "$METRICS" "$METRICS_KIND"; then
+        echo "  $(ls /logs | wc -l) files up -> $METRICS"
+    else
+        echo "  FAILED"
+        return 1
+    fi
 }
 
 push_results() {
