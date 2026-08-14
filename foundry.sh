@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.27
+FOUNDRY_VERSION=2026-08-14.28
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -2591,45 +2591,63 @@ write_ladder() {
     cat > /ladder.txt << 'LADDEREOF'
 # Qwen3.8-27B. LABEL | FALLBACK | rules
 #
-# ffn_down, ffn_gate and ffn_up are 21.2% each, 63.6% together, so they set the
+# Naming follows the same rule as the Nemotron release: AD-<ffn_down>-<ffn_up>,
+# collapsed to one name when both match. The name carries the layout, so nobody
+# has to guess what is inside, and no file is named after a type it does not
+# contain. iq3_m and iq3_xs are ftype mixes, not tensor types, so they can
+# never appear in a rule.
+#
+# ffn_down, ffn_gate and ffn_up are 21.2% each, 63.6% together, and set the
 # size. down carries more of the quality and sits one step above the other two
-# at every rung; a preset gives all three the same type, and that asymmetry is
-# where these win at equal size.
+# at almost every rung. A preset gives all three the same type; that asymmetry
+# is where these win at equal size.
 #
-# attn_gate and ssm_out are 5.5% each. This model is a hybrid and those two are
-# 11% together, so leaving them at q8_0 costs 3.2 GB in every file.
+# attn_gate and ssm_out are 5.5% each. This is a hybrid model and those two are
+# 11% together, so they move with the rung instead of sitting at q8_0.
 #
-# attn_k and attn_v are 0.3% each: kept at q8_0 everywhere, it is free.
+# attn_k and attn_v are 0.3% each: q8_0 everywhere, it costs 0.05 bpw.
 #
-# output and token_embd weigh the same, 4.7%. The head decides the next token
-# and stays high; the embedding table is a lookup whose error stays local to
-# one token, so it drops fast at the bottom.
+# output and token_embd weigh the same, 4.7%, and behave differently. The head
+# picks the next token and stays high. The embedding table is a lookup whose
+# error stays local to one token, so it drops fast at the bottom.
 
-Q8_0        | q8_0 |
-AD-Q6       | q8_0 | ffn_down=q6_k ffn_gate=q6_k ffn_up=q6_k attn_q=q8_0 attn_gate=q6_k ssm_out=q8_0
-AD-Q5_XL    | q8_0 | ffn_down=q6_k ffn_gate=q5_k ffn_up=q5_k attn_q=q6_k attn_gate=q5_k ssm_out=q6_k
-AD-Q5       | q8_0 | ffn_down=q5_k ffn_gate=q5_k ffn_up=q5_k attn_q=q5_k attn_gate=q5_k ssm_out=q6_k
-AD-Q4_XL    | q8_0 | ffn_down=q5_k ffn_gate=q4_k ffn_up=q4_k attn_q=q5_k attn_gate=q4_k ssm_out=q5_k output=q6_k
-AD-IQ4      | q8_0 | ffn_down=q4_k ffn_gate=iq4_xs ffn_up=iq4_xs attn_q=iq4_xs attn_gate=iq4_xs ssm_out=q5_k output=q6_k token_embd=q5_k
-AD-IQ3_XL   | q8_0 | ffn_down=iq4_xs ffn_gate=iq3_s ffn_up=iq3_s attn_q=iq4_xs attn_gate=iq4_xs ssm_out=iq4_xs output=q5_k token_embd=q4_k
-AD-IQ3      | q8_0 | ffn_down=iq3_s ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq4_xs output=q5_k token_embd=iq4_xs
-AD-IQ2_XL   | q8_0 | ffn_down=iq3_xxs ffn_gate=iq2_m ffn_up=iq2_m attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq3_xxs
-AD-IQ2      | q8_0 | ffn_down=iq2_m ffn_gate=iq2_s ffn_up=iq2_s attn_q=iq3_s attn_gate=iq3_xxs ssm_out=iq3_xxs output=q4_k token_embd=iq3_xxs
-AD-IQ2_S    | q8_0 | ffn_down=iq2_s ffn_gate=iq2_xxs ffn_up=iq2_xxs attn_q=iq3_xxs attn_gate=iq2_m ssm_out=iq3_xxs output=q4_k token_embd=iq2_xxs
-AD-IQ1_M    | q8_0 | ffn_down=iq2_xxs ffn_gate=iq1_m ffn_up=iq1_m attn_q=iq3_xxs attn_gate=iq2_s ssm_out=iq2_m output=iq4_xs token_embd=iq2_xxs
-AD-IQ1_S    | q8_0 | ffn_down=iq2_xxs ffn_gate=iq1_s ffn_up=iq1_s attn_q=iq2_m attn_gate=iq2_s ssm_out=iq2_m output=iq4_xs token_embd=iq2_xxs
+# ---- above 24 GB
+AD-Q8_0             | q8_0 |
+AD-Q6_K             | q8_0 | ffn_down=q6_k ffn_gate=q6_k ffn_up=q6_k attn_q=q8_0 attn_gate=q6_k ssm_out=q8_0
 
-# The stock presets, as the baseline. Without them "better than the preset at
-# the same size" has nothing to stand on.
-Q6_K        | q6_k |
-Q5_K_M      | q5_k_m |
-Q4_K_M      | q4_k_m |
-IQ4_XS      | iq4_xs |
-IQ3_M       | iq3_m |
-IQ3_XXS     | iq3_xxs |
-IQ2_M       | iq2_m |
-IQ2_XXS     | iq2_xxs |
-IQ1_M       | iq1_m |
+# ---- 32 GB card
+AD-Q6_K-Q5_K        | q8_0 | ffn_down=q6_k ffn_gate=q5_k ffn_up=q5_k attn_q=q6_k attn_gate=q5_k ssm_out=q6_k
+AD-Q5_K             | q8_0 | ffn_down=q5_k ffn_gate=q5_k ffn_up=q5_k attn_q=q5_k attn_gate=q5_k ssm_out=q6_k
+AD-Q5_K-Q4_K        | q8_0 | ffn_down=q5_k ffn_gate=q4_k ffn_up=q4_k attn_q=q5_k attn_gate=q4_k ssm_out=q5_k output=q6_k
+
+# ---- 24 GB card
+AD-Q4_K             | q8_0 | ffn_down=q4_k ffn_gate=q4_k ffn_up=q4_k attn_q=q4_k attn_gate=q4_k ssm_out=q5_k output=q6_k
+AD-Q4_K-IQ4_XS      | q8_0 | ffn_down=q4_k ffn_gate=iq4_xs ffn_up=iq4_xs attn_q=iq4_xs attn_gate=iq4_xs ssm_out=q5_k output=q6_k token_embd=q5_k
+AD-IQ4_XS           | q8_0 | ffn_down=iq4_xs ffn_gate=iq4_xs ffn_up=iq4_xs attn_q=iq4_xs attn_gate=iq4_xs ssm_out=iq4_xs output=q6_k token_embd=q5_k
+
+# ---- 16 GB card
+AD-IQ4_XS-IQ3_S     | q8_0 | ffn_down=iq4_xs ffn_gate=iq3_s ffn_up=iq3_s attn_q=iq4_xs attn_gate=iq4_xs ssm_out=iq4_xs output=q5_k token_embd=q4_k
+AD-IQ3_S            | q8_0 | ffn_down=iq3_s ffn_gate=iq3_s ffn_up=iq3_s attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq4_xs output=q5_k token_embd=q4_k
+AD-IQ3_S-IQ3_XXS    | q8_0 | ffn_down=iq3_s ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq4_xs output=q5_k token_embd=iq4_xs
+AD-IQ3_XXS          | q8_0 | ffn_down=iq3_xxs ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq4_xs
+
+# ---- 12 GB card
+AD-IQ3_XXS-IQ2_M    | q8_0 | ffn_down=iq3_xxs ffn_gate=iq2_m ffn_up=iq2_m attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq3_xxs
+AD-IQ2_M            | q8_0 | ffn_down=iq2_m ffn_gate=iq2_m ffn_up=iq2_m attn_q=iq3_s attn_gate=iq3_s ssm_out=iq3_xxs output=q5_k token_embd=iq3_xxs
+AD-IQ2_M-IQ2_S      | q8_0 | ffn_down=iq2_m ffn_gate=iq2_s ffn_up=iq2_s attn_q=iq3_s attn_gate=iq3_xxs ssm_out=iq3_xxs output=q4_k token_embd=iq3_xxs
+AD-IQ2_S-IQ2_XS     | q8_0 | ffn_down=iq2_s ffn_gate=iq2_xs ffn_up=iq2_xs attn_q=iq3_xxs attn_gate=iq2_m ssm_out=iq3_xxs output=q4_k token_embd=iq2_xxs
+
+# ---- 8 to 10 GB
+AD-IQ2_S-IQ2_XXS    | q8_0 | ffn_down=iq2_s ffn_gate=iq2_xxs ffn_up=iq2_xxs attn_q=iq3_xxs attn_gate=iq2_m ssm_out=iq2_m output=q4_k token_embd=iq2_xxs
+AD-IQ2_XXS          | q8_0 | ffn_down=iq2_xxs ffn_gate=iq2_xxs ffn_up=iq2_xxs attn_q=iq2_m attn_gate=iq2_s ssm_out=iq2_m output=iq4_xs token_embd=iq2_xxs
+AD-IQ2_XXS-IQ1_M    | q8_0 | ffn_down=iq2_xxs ffn_gate=iq1_m ffn_up=iq1_m attn_q=iq2_m attn_gate=iq2_s ssm_out=iq2_m output=iq4_xs token_embd=iq2_xxs
+AD-IQ2_XXS-IQ1_S    | q8_0 | ffn_down=iq2_xxs ffn_gate=iq1_s ffn_up=iq1_s attn_q=iq2_m attn_gate=iq2_s ssm_out=iq2_m output=iq4_xs token_embd=iq2_xxs
+
+# ---- the standard mixes, built with the same imatrix. People ask for these by
+# name, and they are also the honest baseline: same calibration, stock layout.
+Q6_K                | q6_k |
+Q5_K_M              | q5_k |
+Q4_K_M              | q4_k |
 LADDEREOF
     echo "wrote /ladder.txt, $(grep -c '|' /ladder.txt) rungs"
     echo "check the sizes first:   ladder /ladder.txt --dry"
