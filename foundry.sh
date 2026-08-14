@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.22
+FOUNDRY_VERSION=2026-08-14.23
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -156,6 +156,24 @@ except Exception as e:
 PUTEOF
 }
 
+hf_put_dir() {
+    if [ -z "$HF_TOKEN" ] && [ ! -f ~/.cache/huggingface/token ]; then
+        echo "no token in this shell. export HF_TOKEN, then save_token"
+        return 1
+    fi
+    python3 - "$1" "$2" "$3" "$4" << 'PUTDEOF'
+import sys
+from huggingface_hub import HfApi
+local, remote, repo, kind = sys.argv[1:5]
+try:
+    HfApi().upload_folder(folder_path=local, path_in_repo=remote,
+                          repo_id=repo, repo_type=kind)
+except Exception as e:
+    print(str(e).splitlines()[0])
+    sys.exit(1)
+PUTDEOF
+}
+
 # These boxes are rented and ephemeral, so keeping the token in the shell
 # profile is a fair trade for not losing an upload in every new pane.
 save_token() {
@@ -198,7 +216,7 @@ selfcheck() {
              get_external kld_ext autopush push_base push_logs push_results push_model \
              pull_logs get_imatrix get_calib wait_calib im_size im_plan \
              im_shard im_range im_merge im_merge_all im_stats push_shards \
-             im_status; do
+             im_status hf_put_dir; do
         type -t $f > /dev/null 2>&1 || MISSING="$MISSING $f"
     done
     if [ -n "$MISSING" ]; then
@@ -1866,10 +1884,8 @@ push_corpus() {
     fi
     ls -la /calib-corpora/builds/$1
     cd /calib-corpora
-    hf upload AtomicChat/calib-corpora --repo-type dataset \
-        builds/$1 builds/$1
-    hf upload AtomicChat/calib-corpora --repo-type dataset \
-        /recipes/$1.yaml recipes/$1.yaml
+    hf_put_dir builds/$1 builds/$1 AtomicChat/calib-corpora dataset
+    hf_put /recipes/$1.yaml recipes/$1.yaml AtomicChat/calib-corpora dataset
     cd -
     echo "every box can now: get_calib $1"
 }
@@ -2359,6 +2375,24 @@ for name, g in sorted(groups.items(), key=lambda kv: -kv[1]["elems"]):
     print("%-18s %6d %14d %6.1f%%   %s" % (
         name, g["count"], g["elems"], 100.0 * g["elems"] / total, div))
 print()
+unmatched = [t.name for t in reader.tensors if group_of(t.name) == "other"]
+if unmatched:
+    big = sorted(((t.name, 1) for t in reader.tensors if group_of(t.name) == "other"))
+    sizes = {}
+    for t in reader.tensors:
+        if group_of(t.name) != "other":
+            continue
+        n = 1
+        for d in t.shape:
+            n *= int(d)
+        key = t.name.split(".", 2)[-1] if t.name.startswith("blk.") else t.name
+        sizes[key] = sizes.get(key, 0) + n
+    print()
+    print("what fell into 'other', by suffix:")
+    for k, v in sorted(sizes.items(), key=lambda kv: -kv[1])[:12]:
+        print("  %-40s %14d  %5.1f%%" % (k, v, 100.0 * v / total))
+    print()
+
 print("K = row divides by 256, so k and i quants work on it")
 print("6 = divides by 64,  3 = divides by 32")
 print("A group without K cannot hold any k/i quant: llama.cpp silently swaps in")
@@ -2608,7 +2642,7 @@ for r in out:
 print()
 print('%d files merged into /logs/results.json' % len(out))
 MERGEEOF
-    hf upload $METRICS --repo-type $METRICS_KIND /logs/results.json results.json
+    hf_put /logs/results.json results.json "$METRICS" "$METRICS_KIND"
 }
 
 
@@ -2625,9 +2659,9 @@ push_base() {
         return 1
     fi
 
-    hf upload $METRICS --repo-type $METRICS_KIND /logs/base-$EVALSET.log logs/base-$EVALSET.log
-    [ -f /logs/env.txt ] && hf upload $METRICS --repo-type $METRICS_KIND /logs/env.txt logs/env.txt
-    [ -f /logs/llama-commit.txt ] && hf upload $METRICS --repo-type $METRICS_KIND /logs/llama-commit.txt logs/llama-commit.txt
+    hf_put /logs/base-$EVALSET.log logs/base-$EVALSET.log "$METRICS" "$METRICS_KIND"
+    [ -f /logs/env.txt ] && hf_put /logs/env.txt logs/env.txt "$METRICS" "$METRICS_KIND"
+    [ -f /logs/llama-commit.txt ] && hf_put /logs/llama-commit.txt logs/llama-commit.txt "$METRICS" "$METRICS_KIND"
 
     if [ ! -f $BASE ]; then
         echo "no .kld on disk, only the log went up"
@@ -2668,12 +2702,12 @@ push_base() {
         cp /kld/README.md /kld/parts/
         echo
         ask "upload the parts now?" || return 0
-        hf upload $METRICS --repo-type $METRICS_KIND /kld/parts kld
+        hf_put_dir /kld/parts kld "$METRICS" "$METRICS_KIND"
     else
         ask "upload the blob now?" || return 0
-        hf upload $METRICS --repo-type $METRICS_KIND $BASE kld/base-$EVALSET.kld
-        hf upload $METRICS --repo-type $METRICS_KIND /kld/base-$EVALSET.manifest.txt kld/base-$EVALSET.manifest.txt
-        hf upload $METRICS --repo-type $METRICS_KIND /kld/README.md kld/README.md
+        hf_put $BASE kld/base-$EVALSET.kld "$METRICS" "$METRICS_KIND"
+        hf_put /kld/base-$EVALSET.manifest.txt kld/base-$EVALSET.manifest.txt "$METRICS" "$METRICS_KIND"
+        hf_put /kld/README.md kld/README.md "$METRICS" "$METRICS_KIND"
     fi
     echo "done"
 }
@@ -2781,7 +2815,7 @@ push_logs() {
     need_preset || return 1
     repo_ok || return 1
     du -sh /logs
-    hf upload $METRICS --repo-type $METRICS_KIND /logs logs
+    hf_put_dir /logs logs "$METRICS" "$METRICS_KIND"
 }
 
 push_results() {
@@ -2791,7 +2825,7 @@ push_results() {
         echo "no results.json. Run results first."
         return 1
     fi
-    hf upload $METRICS --repo-type $METRICS_KIND /logs/results.json results.json
+    hf_put /logs/results.json results.json "$METRICS" "$METRICS_KIND"
 }
 
 push_model() {
@@ -2803,7 +2837,7 @@ push_model() {
         return 1
     fi
     ls -lh $1
-    hf upload $MAIN $1 $(basename $1)
+    hf_put "$1" "$(basename $1)" "$MAIN" model
 }
 
 push_model_split() {
@@ -2813,14 +2847,14 @@ push_model_split() {
     mkdir -p /gguf/split
     $BIN/llama-gguf-split --split --split-max-size 45G $1 $PREFIX
     ls -lh $PREFIX*
-    hf upload $MAIN /gguf/split $(basename $1 .gguf)
+    hf_put_dir /gguf/split "$(basename $1 .gguf)" "$MAIN" model
     echo "Uploaded as a folder of shards. Readers point at shard 1."
 }
 
 push_card() {
     need_preset || return 1
     if [ ! -f "$1" ]; then echo "no file at $1"; return 1; fi
-    hf upload $MAIN $1 README.md
+    hf_put "$1" README.md "$MAIN" model
 }
 
 
