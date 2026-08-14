@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.14
+FOUNDRY_VERSION=2026-08-14.16
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -55,6 +55,445 @@ reload() {
 BIN=/llama.cpp/build/bin
 STATE=/state.sh
 CTX=4096
+
+# ------------------------------------------------------------------ basics
+# Bash functions live in one shell process, so a new tmux pane knows nothing.
+# save_state writes the current selection to /state.sh and the bottom of this
+# file reads it back, so every pane agrees.
+save_state() {
+    cat > $STATE << STATEEOF
+MAIN=$MAIN
+RECIPE=$RECIPE
+METRICS=$METRICS
+METRICS_KIND=$METRICS_KIND
+UPSTREAM=$UPSTREAM
+EVALSET=$EVALSET
+EVAL=$EVAL
+BASE=$BASE
+CTX=$CTX
+IM_TOKENS_EXACT=$IM_TOKENS_EXACT
+IM_MODEL=$IM_MODEL
+IM_CORPUS=$IM_CORPUS
+IM_CTX=$IM_CTX
+GPUS=$GPUS
+AUTOPUSH=$AUTOPUSH
+INCLUDE_EXPERIMENTAL=$INCLUDE_EXPERIMENTAL
+STATEEOF
+}
+
+persist_shell() {
+    grep -q "source /foundry.sh" ~/.bashrc 2>/dev/null || echo "source /foundry.sh" >> ~/.bashrc
+    echo "Added to ~/.bashrc. Every new tmux pane now loads this by itself."
+}
+
+# Never guess a repo id.
+find_repo() {
+    if [ -z "$1" ]; then
+        echo "find_repo QUERY        e.g. find_repo Qwen3.8"
+        return 1
+    fi
+    python3 - "$1" << 'FINDEOF'
+import sys
+from huggingface_hub import HfApi
+q = sys.argv[1]
+try:
+    hits = list(HfApi().list_models(search=q, sort="downloads", direction=-1, limit=40))
+except Exception as e:
+    print("search failed: %s" % e)
+    sys.exit(1)
+if not hits:
+    print("nothing on the hub matches %r" % q)
+    sys.exit(1)
+print("%-52s %12s  %s" % ("repo id", "downloads", "updated"))
+for m in hits:
+    print("%-52s %12s  %s" % (m.id, m.downloads or 0,
+                              str(getattr(m, "lastModified", ""))[:10]))
+print()
+print("original weights live under the vendor org, not in a GGUF repo.")
+FINDEOF
+}
+
+# The single definition of "a file we measure". Everything else in /gguf is a
+# reference, a drafter, or the imatrix, and none of those are quants.
+INCLUDE_EXPERIMENTAL=${INCLUDE_EXPERIMENTAL:-0}
+
+quant_files() {
+    if [ "$INCLUDE_EXPERIMENTAL" = "1" ]; then
+        DEPTH=2
+    else
+        DEPTH=1
+    fi
+    find /gguf -maxdepth $DEPTH -name "*.gguf" 2>/dev/null \
+        | grep -v -i "bf16" \
+        | grep -v "/dflash-" \
+        | grep -v "/dspark-" \
+        | grep -v -i "imatrix" \
+        | sort
+}
+
+autopush() {
+    if [ "$AUTOPUSH" != "1" ] || [ -z "$METRICS" ] || [ ! -f "$1" ]; then
+        return 0
+    fi
+    OUT=$(hf upload $METRICS --repo-type $METRICS_KIND "$1" "$2" 2>&1)
+    if [ $? -eq 0 ]; then
+        echo "  uploaded -> $METRICS :: $2"
+    else
+        echo "  UPLOAD FAILED for $2:"
+        echo "$OUT" | sed "s/^/    /"
+    fi
+}
+
+# Every function this file advertises has to exist. Editing a big shell file by
+# cutting between two function names quietly eats whatever sat between them,
+# and the symptom is a command not found long after the damage.
+selfcheck() {
+    MISSING=""
+    for f in save_state persist_shell reload find_repo use_model show_preset \
+             check repo_ok token_check make_metrics make_repos clean_run \
+             setup build gpu_test get_tools check_pool fix_pool install_auto_fmt \
+             setup_corpus build_corpus push_corpus corpus_check make_recipe \
+             new_model pick_model get_eval get_eval_set eval_size get_bf16 \
+             get_quants get_one find_bf16 quant_files get_upstream make_bf16 \
+             base kld kld_all bench bench_all gen results bits quantize \
+             get_external autopush push_base push_logs push_results push_model \
+             pull_logs get_imatrix get_calib wait_calib im_size im_plan \
+             im_shard im_range im_merge im_merge_all im_stats; do
+        type -t $f > /dev/null 2>&1 || MISSING="$MISSING $f"
+    done
+    if [ -n "$MISSING" ]; then
+        echo "MISSING functions:$MISSING"
+        echo "the file on disk is incomplete. Pull it again."
+        return 1
+    fi
+    echo "all functions present, version $FOUNDRY_VERSION"
+}
+
+
+setup_convert() {
+    echo "This installs torch and friends so convert_hf_to_gguf.py can run."
+    echo "Around 3 GB of downloads. Only needed when we have to BUILD a bf16 gguf."
+    ask "install?" || return 1
+    pip install --break-system-packages -q -U -r /llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+    echo "done. If the converter complains about RoPE, pin transformers below 5."
+}
+
+help_me() {
+cat << 'HELP_EOF'
+
+PRESET
+  use_model NAME REPO        any model, verified against the hub
+  use_nemotron / use_qwen    shortcuts
+  find_repo QUERY            search the hub so a repo id is never guessed
+  show_preset / plan / status / menu / selfcheck
+
+BOX SETUP
+  check / cuda_check / fix_cuda_compat
+  setup                      apt and the hugging face cli
+  build 120                  compile. 120 blackwell, 90 hopper, 89 ada, 86 ampere
+  gpu_test                   does ggml actually see the GPUs
+  persist_shell              auto-source this in every new tmux pane
+  clean_run                  wipe logs, kld and imatrix from a previous model
+
+REPOS
+  token_check / repo_ok / make_metrics / make_repos
+  ls_main / ls_metrics / ls_corpora
+
+A MODEL WE HAVE NEVER QUANTIZED
+  new_model NAME REPO        template check plus a filled in recipe
+  make_recipe NAME REPO      just the recipe, read from the hub
+  corpus_check DIR_OR_REPO   which tool call shape the template accepts, and
+                             which markers are real special tokens
+  get_upstream / setup_convert / make_bf16
+
+CORPUS
+  get_tools / check_pool / fix_pool / install_auto_fmt / setup_corpus
+  build_corpus NAME          vocab sweep for this tokenizer, then the corpus
+  push_corpus NAME           publish the build and the recipe
+  get_calib NAME / wait_calib NAME
+
+IMATRIX, split across as many boxes as you like
+  pick_model                 choose IM_MODEL, bf16 first
+  IM_TOKENS_EXACT=N          real token count, so shards come out even
+  IM_BATCH=4096              lower it when the vocabulary is large
+  im_size / im_plan N
+  im_shard I N               node I of N, 0 based
+  im_range FROM COUNT LABEL  explicit range, for rebalancing a slow box
+  im_merge N / im_merge_all / im_stats FILE / get_imatrix
+
+QUANTIZE
+  bits                       what each tensor group weighs, and its divisibility
+  bits 'RULE' 'RULE'         predict the size before spending the time
+  quantize LABEL TYPE ...    llama-quantize with the merged imatrix
+  get_external REPO PATTERN  someone else's build, measured on our reference
+
+MEASURE
+  get_eval / get_eval_set NAME / eval_size / set_ctx N
+  base                       write the reference from bf16
+  use_gpus 0,1               how many GPUs the quant runs may use
+  kld MODEL / kld_all / bench MODEL / bench_all / gen MODEL NGL "EXTRA"
+  results / pull_logs
+
+UPLOAD
+  push_base / push_logs / push_results
+  push_model FILE / push_model_split FILE / push_card FILE
+  send_base user@host PORT
+
+HELP_EOF
+}
+
+# ------------------------------------------------------------------ presets
+
+use_nemotron() {
+    MAIN=AtomicChat/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF
+    METRICS=AtomicChat/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF-metrics
+    METRICS_KIND=dataset
+    UPSTREAM=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+    RECIPE=nemotron-3.5-lightning
+    save_state
+    show_preset
+}
+
+# For anything without a preset. Names our repos by convention and refuses a
+# repo id that does not exist, so a typo cannot propagate into every later step.
+use_model() {
+    if [ -z "$2" ]; then
+        echo "use_model SHORTNAME UPSTREAM_REPO"
+        echo "  use_model qwen3.8-27b Qwen/Qwen3.8-27B"
+        return 1
+    fi
+    if ! python3 -c "
+import sys
+from huggingface_hub import HfApi
+sys.exit(0 if HfApi().repo_exists(sys.argv[1]) else 1)
+" "$2" 2>/dev/null; then
+        echo "no such repo on the hub: $2"
+        echo "find the real id with:   find_repo <part of the name>"
+        return 1
+    fi
+    RECIPE=$1
+    UPSTREAM=$2
+    MAIN=AtomicChat/$(basename $2)-GGUF
+    METRICS=AtomicChat/$(basename $2)-GGUF-metrics
+    METRICS_KIND=dataset
+    save_state
+    show_preset
+}
+
+use_qwen() {
+    use_model qwen3.8-27b Qwen/Qwen3.8-27B
+}
+
+show_preset() {
+    echo "recipe name   : ${RECIPE:-not set}"
+    echo "our gguf repo : $MAIN"
+    echo "metrics repo  : $METRICS  (type: $METRICS_KIND)"
+    echo "upstream      : $UPSTREAM"
+    echo "eval corpus   : $EVAL"
+    echo "context       : $CTX"
+    echo
+    echo "Run plan to see what exists where and what to do next."
+}
+
+need_preset() {
+    if [ -z "$MAIN" ]; then
+        echo "No preset loaded. Run use_model NAME REPO first."
+        return 1
+    fi
+}
+
+ask() {
+    read -p "$1 [y/N] " answer
+    if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
+        return 0
+    fi
+    echo "skipped"
+    return 1
+}
+
+use_evalset() {
+    if [ -z "$1" ]; then
+        echo "use_evalset neutral | agentic | code       current: $EVALSET"
+        return 1
+    fi
+    EVALSET=$1
+    EVAL=/eval/$1.txt
+    BASE=/kld/base-$1.kld
+    save_state
+    echo "eval set  : $EVALSET"
+    echo "corpus    : $EVAL"
+    echo "reference : $BASE"
+}
+
+set_ctx() {
+    if [ -z "$1" ]; then
+        echo "set_ctx 4096      current: $CTX"
+        return 1
+    fi
+    CTX=$1
+    save_state
+    echo "context is now $CTX"
+    eval_size
+}
+
+# ------------------------------------------------------------------ orientation
+
+mark() {
+    if [ -e "$2" ]; then
+        echo "  [x] $1"
+    else
+        echo "  [ ] $1        ->  run:  $3"
+    fi
+}
+
+status() {
+    echo
+    if [ -z "$MAIN" ]; then
+        echo "  [ ] preset loaded      ->  run:  use_model NAME REPO"
+    else
+        echo "  [x] preset: $MAIN"
+    fi
+    mark "cuda checked"       /logs/env.txt              "cuda_check"
+    mark "tools installed"    /usr/bin/ninja             "setup"
+    mark "llama.cpp built"    $BIN/llama-imatrix         "build 120"
+    mark "eval corpus"        $EVAL                      "get_eval"
+
+    if find /gguf -name "*.gguf" 2>/dev/null | grep -qi bf16; then
+        echo "  [x] bf16 on disk"
+    else
+        echo "  [ ] bf16 on disk       ->  run:  get_bf16, or make_bf16 for a new model"
+    fi
+
+    STALE=$(ls /logs/kld-*.log /logs/bench-*.json 2>/dev/null | grep -v -i "$(basename ${MAIN:-zzz} -GGUF)" | wc -l)
+    if [ "$STALE" -gt 0 ]; then
+        echo
+        echo "  !! $STALE log(s) in /logs belong to a different model."
+        echo "     results would mix them in and push_logs would upload them."
+        echo "     run:  clean_run"
+        echo
+    fi
+
+    QN=$(quant_files | wc -l)
+    if [ "$QN" -gt 0 ]; then
+        echo "  [x] quants on disk: $QN files"
+    else
+        echo "  [ ] quants on disk     ->  run:  get_quants, or quantize them here"
+    fi
+
+    mark "reference built"    $BASE                      "base"
+    KLDS=$(ls /logs/kld-*.log 2>/dev/null | wc -l)
+    echo "  [$([ $KLDS -gt 0 ] && echo x || echo ' ')] kld logs: $KLDS       ->  run:  kld_all"
+    BENCHES=$(ls /logs/bench-*.json 2>/dev/null | wc -l)
+    echo "  [$([ $BENCHES -gt 0 ] && echo x || echo ' ')] bench logs: $BENCHES     ->  run:  bench_all"
+    mark "results.json"       /logs/results.json         "results"
+
+    echo
+    echo "  imatrix:"
+    if [ -f /eval/calib_train.txt ]; then
+        echo "    [x] calibration corpus"
+    else
+        echo "    [ ] calibration corpus  ->  run:  get_calib $RECIPE"
+    fi
+    if [ -n "$IM_MODEL" ] && [ -f "$IM_MODEL" ]; then
+        echo "    [x] IM_MODEL: $(basename $IM_MODEL)"
+    else
+        echo "    [ ] IM_MODEL not set    ->  run:  pick_model"
+    fi
+    SHARDS=$(ls /imatrix/shard-*.gguf 2>/dev/null | wc -l)
+    if [ -f /imatrix/imatrix.gguf ]; then
+        echo "    [x] imatrix merged"
+    elif [ "$SHARDS" -gt 0 ]; then
+        echo "    [~] $SHARDS shard(s) here  ->  run:  im_merge_all once every node is done"
+    else
+        echo "    [ ] no imatrix          ->  run:  im_plan N, then im_shard I N on each box"
+    fi
+
+    echo
+    echo "  full command list: help_me      pick by number: menu"
+    echo "  remote view: plan               integrity: selfcheck"
+    echo
+}
+
+menu() {
+    echo
+    echo "  model    : ${MAIN:-none, pick a preset first}"
+    echo "  eval set : $EVALSET   context: $CTX"
+    echo
+    PS3="
+number: "
+    select picked in \
+        "status" "plan" "help_me" "selfcheck" \
+        "cuda_check" "setup" "build 120" "gpu_test" \
+        "get_bf16" "get_quants" "find_bf16" "get_eval" "eval_size" \
+        "pick_model" "im_size" "bits" \
+        "base" "kld_all" "bench_all" "results" \
+        "push_base" "push_logs" "push_results" "pull_logs" \
+        "ls_main" "ls_metrics" "ls_corpora" \
+        "quit"
+    do
+        if [ "$picked" = "quit" ] || [ -z "$picked" ]; then
+            break
+        fi
+        echo "--> $picked"
+        eval "$picked"
+        break
+    done
+}
+
+# ------------------------------------------------------------------ box setup
+
+check() {
+    echo "=== free space on / ==="
+    df -h /
+    echo
+    echo "=== GPUs ==="
+    nvidia-smi --query-gpu=index,name,memory.total --format=csv
+    echo
+    echo "=== cores / RAM ==="
+    nproc
+    free -g | head -2
+}
+
+cuda_check() {
+    mkdir -p /logs
+    echo "=== toolkit in the container ==="
+    nvcc --version | tail -2
+    echo
+    echo "=== host driver ==="
+    nvidia-smi --query-gpu=name,driver_version --format=csv
+    echo
+    echo "=== forward compatibility libraries ==="
+    COMPAT_LIB=$(ls /usr/local/cuda/compat/libcuda.so.*.* 2>/dev/null | head -1)
+    if [ -z "$COMPAT_LIB" ]; then
+        echo "none present, nothing to do"
+    else
+        COMPAT_MAJOR=$(basename $COMPAT_LIB | sed "s/libcuda.so.//" | cut -d. -f1)
+        HOST_MAJOR=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1)
+        echo "compat libs target driver $COMPAT_MAJOR, host driver is $HOST_MAJOR"
+        if [ "$HOST_MAJOR" -ge "$COMPAT_MAJOR" ]; then
+            echo "Host driver is newer or equal, so these libs can only break CUDA init."
+            fix_cuda_compat
+        else
+            echo "Host driver is older, so these libs are needed. Leaving them alone."
+        fi
+    fi
+
+    {
+        grep PRETTY_NAME /etc/os-release
+        nvcc --version | tail -2
+        nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+    } > /logs/env.txt
+    echo
+    echo "written to /logs/env.txt, it ships to the metrics repo with push_logs"
+}
+
+fix_cuda_compat() {
+    rm -rf /usr/local/cuda*/compat
+    ldconfig
+    echo "Compat libraries removed. The host driver now wins."
+}
+
+
 
 # Measurements from a previous model on the same box would be parsed into this
 # model's results and uploaded to its metrics repo. Wipe them when switching.
@@ -1463,7 +1902,8 @@ for t in r.tensors:
 else:
     print(0)
 " 2>/dev/null)
-    if [ -n "$VOCAB" ] && [ "$VOCAB" -gt 0 ]; then
+    VOCAB=$(echo "$VOCAB" | head -1 | tr -dc '0-9')
+    if [ -n "$VOCAB" ] && [ "$VOCAB" -gt 0 ] 2>/dev/null; then
         LOGIT_GB=$(( VOCAB * IM_BATCH * 4 / 1000000000 ))
         MODEL_GB=$(( $(stat -c %s $IM_MODEL) / 1000000000 ))
         # Only the cards this process can see. Two shards on one box each get
@@ -1518,6 +1958,84 @@ else:
         hf upload $METRICS --repo-type $METRICS_KIND $OUT imatrix/shard-$I-of-$N.gguf \
             && echo "  shard uploaded, the merging box can pick it up"
     fi
+}
+
+# im_range FROM COUNT LABEL
+# im_shard splits evenly, which assumes every box runs at the same speed. They
+# do not: rented machines differ by half again on the same cards, and the
+# slowest one ends up on the critical path. This takes an explicit range so a
+# long shard can be cut up and handed to whoever is free.
+#
+#   im_range 7275 700 5a
+#   im_range 7975 0   5b      count 0 means "to the end of the corpus"
+im_range() {
+    if [ -z "$2" ] || [ -z "$3" ]; then
+        echo "im_range FROM COUNT LABEL      count 0 runs to the end"
+        echo "  im_range 7275 700 5a"
+        return 1
+    fi
+    if [ ! -f "$IM_MODEL" ]; then
+        echo "IM_MODEL is not set or missing: ${IM_MODEL:-unset}"
+        return 1
+    fi
+    FROM=$1
+    COUNT=$2
+    OUT=/imatrix/shard-$3.gguf
+    mkdir -p /imatrix
+
+    if [ "$COUNT" = "0" ]; then
+        LIMIT=""
+        echo "chunks $FROM to the end of the corpus"
+    else
+        LIMIT="--chunks $COUNT"
+        echo "chunks $FROM to $(( FROM + COUNT - 1 ))"
+    fi
+    date
+    START=$(date +%s)
+
+    $BIN/llama-imatrix -m $IM_MODEL -f $IM_CORPUS -o $OUT \
+        -ngl 99 -c $IM_CTX -b $IM_BATCH -ub $IM_BATCH \
+        --parse-special --no-ppl \
+        --from-chunk $FROM $LIMIT \
+        2>&1 | tee /logs/imatrix-shard-$3.log
+
+    echo "took $(( $(date +%s) - START )) seconds"
+    ls -lh $OUT 2>/dev/null
+    autopush /logs/imatrix-shard-$3.log logs/imatrix-shard-$3.log
+    if [ -f "$OUT" ]; then
+        hf upload $METRICS --repo-type $METRICS_KIND $OUT imatrix/shard-$3.gguf \
+            && echo "  shard uploaded"
+    fi
+}
+
+# Merge whatever shards are present, whatever they are called. Use this after
+# rebalancing with im_range, when the names no longer follow I-of-N.
+im_merge_all() {
+    need_preset || return 1
+    repo_ok || return 1
+    mkdir -p /imatrix
+    hf download $METRICS --repo-type $METRICS_KIND --include "imatrix/shard-*" --local-dir /tmp/im
+    cp -n /tmp/im/imatrix/shard-*.gguf /imatrix/ 2>/dev/null
+
+    FILES=$(ls /imatrix/shard-*.gguf 2>/dev/null | sort)
+    if [ -z "$FILES" ]; then
+        echo "no shards found"
+        return 1
+    fi
+    echo "merging $(echo "$FILES" | wc -l) shards:"
+    echo "$FILES" | sed "s/^/  /"
+
+    ARGS=""
+    for f in $FILES; do
+        ARGS="$ARGS --in-file $f"
+    done
+    $BIN/llama-imatrix $ARGS -o /imatrix/imatrix.gguf 2>&1 | tee /logs/imatrix-merge.log
+    ls -lh /imatrix/imatrix.gguf
+    $BIN/llama-imatrix --in-file /imatrix/imatrix.gguf --show-statistics \
+        2>&1 | tee /logs/imatrix-stats.log | head -30
+    autopush /logs/imatrix-merge.log logs/imatrix-merge.log
+    autopush /logs/imatrix-stats.log logs/imatrix-stats.log
+    hf upload $METRICS --repo-type $METRICS_KIND /imatrix/imatrix.gguf imatrix/imatrix.gguf
 }
 
 im_merge() {
