@@ -9,6 +9,9 @@
 # Nothing runs in the background. Every function says what it is doing,
 # checks its inputs, and stops loudly when something is missing.
 
+# Bump this on every change. reload prints it, so a stale copy is obvious.
+FOUNDRY_VERSION=2026-08-14.12
+
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
 
@@ -1254,16 +1257,25 @@ build_corpus() {
     echo "A sweep built for another model covers a different vocabulary and is"
     echo "worthless here, so this is regenerated every time."
 
-    BEFORE=$(git -C /calib-corpora status --porcelain pool/vocab_sweep | md5sum)
+    # Compare before against after. A file can already be dirty for reasons
+    # that have nothing to do with the sweep: repairing an LFS pointer replaces
+    # the stub with real data, which git reports as a modification.
+    git -C /calib-corpora status --porcelain pool/vocab_sweep/synthetic \
+        | sort > /tmp/sweep-before.txt
+
     python3 tools/vocab_sweep.py --tokenizer /src/tokenizer.json --name $NAME \
         2>&1 | tee /logs/vocab-sweep-$NAME.log
 
+    git -C /calib-corpora status --porcelain pool/vocab_sweep/synthetic \
+        | sort > /tmp/sweep-after.txt
+
     echo
-    echo "what the sweep touched:"
-    git -C /calib-corpora status --porcelain pool/vocab_sweep
-    # Only a modified shard under synthetic/ matters. sweep-stats.json is shared
-    # and is expected to change, and a brand new shard shows up as untracked.
-    TOUCHED=$(git -C /calib-corpora status --porcelain pool/vocab_sweep/synthetic \
+    echo "what the sweep itself changed:"
+    comm -13 /tmp/sweep-before.txt /tmp/sweep-after.txt | sed "s/^/  /"
+    echo "  (already dirty before the sweep, ignored:)"
+    comm -12 /tmp/sweep-before.txt /tmp/sweep-after.txt | sed "s/^/    /"
+
+    TOUCHED=$(comm -13 /tmp/sweep-before.txt /tmp/sweep-after.txt \
               | grep "^ M" | awk '{print $2}')
     for f in $TOUCHED; do
         case "$f" in
@@ -1305,11 +1317,13 @@ push_corpus() {
         return 1
     fi
     token_check > /dev/null || return 1
-    if [ ! -d /calib-corpora/builds/$1 ]; then
-        echo "nothing was built at /calib-corpora/builds/$1"
-        echo "run build_corpus $1 first, and read its output"
+    if [ ! -f /calib-corpora/builds/$1/calib_train.txt ]; then
+        echo "no corpus at /calib-corpora/builds/$1/calib_train.txt"
+        echo "the directory may exist and be empty from an earlier failed run."
+        echo "run build_corpus $1 and read its output before pushing."
         return 1
     fi
+    ls -la /calib-corpora/builds/$1
     cd /calib-corpora
     hf upload AtomicChat/calib-corpora --repo-type dataset \
         builds/$1 builds/$1
