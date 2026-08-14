@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.37
+FOUNDRY_VERSION=2026-08-14.39
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -2582,6 +2582,28 @@ quantize() {
     echo "publish it with:  push_model $QUANT_OUT"
 }
 
+# Exact size for a rule set, in seconds, without quantizing. bits estimates
+# from nominal bits per weight and does not understand a regex over block
+# numbers, so it cannot price an edge weighted layout. This can.
+#
+#   dryrun q8_0 --tensor-type 'blk\.([0-3])\.ffn_.*=q6_k' --tensor-type ffn_down=q5_k
+dryrun() {
+    if [ -z "$1" ]; then
+        echo "dryrun FALLBACK [--tensor-type RULE ...]"
+        return 1
+    fi
+    find_bf16 || return 1
+    local ftype=$1
+    shift
+    local mtp
+    mtp=$(find_mtp_block)
+    if [ -n "$mtp" ]; then
+        set -- --tensor-type "blk\.$mtp\.=$MTP_TYPE" "$@"
+    fi
+    $BIN/llama-quantize --dry-run $IMFLAG "$@" $BF16_FIRST /tmp/dry.gguf $ftype 2>&1 \
+        | grep -E "quant size|model size|BPW" 
+}
+
 # The list llama-quantize prints under "allowed quantization types" is for the
 # positional ftype argument. --tensor-type takes a ggml_type, and the two are
 # different sets: IQ2_M, IQ3_M, IQ3_XS, Q2_K_S, Q3_K_*, Q4_K_*, Q5_K_* are
@@ -2812,62 +2834,59 @@ write_ladder() {
     cat > /ladder.txt << 'LADDEREOF'
 # Qwen3.8-27B. LABEL | FALLBACK | rules
 #
-# Only ggml types appear in rules. IQ2_M, IQ3_M, IQ3_XS and the Q*_K_S/M/L
-# names are ftype mixes and cannot be assigned to a tensor, whatever the
-# "allowed quantization types" list suggests. That leaves a real gap between
-# iq2_s at 2.5 bpw and iq3_xxs at 3.06, which is why the rungs there move by
-# changing which group steps rather than by finding a type in between.
+# Every rung carries an edge boost, because it was measured rather than
+# assumed. At the same size class, on the same reference:
 #
-# Naming is AD-<ffn_down>-<ffn_up>, collapsed when both match, so the name
-# carries the layout and no file is named after a type it does not contain.
+#   uniform layers                    0.015799
+#   4 layers lifted                   0.014492
+#   16 layers lifted at both ends     0.009811
+#   16 lifted plus 8 more at the head 0.007427
 #
-# ffn_down, ffn_gate and ffn_up are 21.2% each and set the size. down carries
-# more of the quality and sits a step above the other two at most rungs; a
-# preset gives all three the same type.
+# That is better than half the divergence for the same bits, just from where
+# they are spent. im_stats agrees: Sum(Act^2) for attn_gate peaks on layers 52
+# to 62 and again on layer 0, so importance really does sit at the ends, with
+# the tail hotter than the head.
 #
-# attn_gate and ssm_out are 5.5% each, 11% together on this hybrid, so they
-# move with the rung instead of sitting at q8_0.
+# The pattern per rung: blocks 0-3 and 52-63 get one step above the base type,
+# blocks 4-11 get the base type for gate and up as well as down, and the
+# middle of the network takes the rung's nominal layout.
 #
-# attn_k and attn_v are 0.3% each: q8_0 everywhere, it costs 0.05 bpw.
-# output stays high, token_embd drops fast: same weight, different sensitivity.
+# Everything else as before: ffn_down a step above gate and up, attn_k and
+# attn_v at q8_0 since they are 0.3% each, output high and token_embd low.
 
 # ---- above 24 GB
-AD-Q8_0             | q8_0 |
-AD-Q6_K             | q8_0 | ffn_down=q6_k ffn_gate=q6_k ffn_up=q6_k attn_q=q8_0 attn_gate=q6_k ssm_out=q8_0
-AD-Q6_K-Q5_K        | q8_0 | ffn_down=q6_k ffn_gate=q5_k ffn_up=q5_k attn_q=q6_k attn_gate=q5_k ssm_out=q6_k
+Q8_0             | q8_0 |
+AD-Q6_K          | q8_0 | ffn_down=q6_k ffn_gate=q6_k ffn_up=q6_k attn_q=q8_0 attn_gate=q6_k ssm_out=q8_0
 
 # ---- 32 GB card
-AD-Q5_K             | q8_0 | ffn_down=q5_k ffn_gate=q5_k ffn_up=q5_k attn_q=q5_k attn_gate=q5_k ssm_out=q6_k
-AD-Q5_K-Q4_K        | q8_0 | ffn_down=q5_k ffn_gate=q4_k ffn_up=q4_k attn_q=q5_k attn_gate=q4_k ssm_out=q5_k output=q6_k
+AD-Q6_K-Q5_K     | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q8_0 ffn_down=q6_k ffn_gate=q5_k ffn_up=q5_k attn_q=q6_k attn_gate=q6_k ssm_out=q6_k
+AD-Q5_K          | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q6_k blk\.([4-9]|1[01])\.ffn_.*=q6_k ffn_down=q5_k ffn_gate=q5_k ffn_up=q5_k attn_q=q6_k attn_gate=q5_k ssm_out=q6_k
 
 # ---- 24 GB card
-AD-Q4_K             | q8_0 | ffn_down=q4_k ffn_gate=q4_k ffn_up=q4_k attn_q=q4_k attn_gate=q4_k ssm_out=q5_k output=q6_k
-AD-Q4_K-IQ4_XS      | q8_0 | ffn_down=q4_k ffn_gate=iq4_xs ffn_up=iq4_xs attn_q=iq4_xs attn_gate=iq4_xs ssm_out=q5_k output=q6_k token_embd=q5_k
-AD-IQ4_XS           | q8_0 | ffn_down=iq4_xs ffn_gate=iq4_xs ffn_up=iq4_xs attn_q=iq4_xs attn_gate=iq4_xs ssm_out=iq4_xs output=q6_k token_embd=q5_k
+AD-Q5_K-Q4_K     | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q6_k blk\.([4-9]|1[01])\.ffn_.*=q5_k ffn_down=q5_k ffn_gate=q4_k ffn_up=q4_k attn_q=q5_k attn_gate=q5_k ssm_out=q5_k output=q6_k
+AD-Q4_K          | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q6_k blk\.([4-9]|1[01])\.ffn_.*=q5_k ffn_down=q5_k ffn_gate=q4_k ffn_up=q4_k attn_q=q5_k attn_gate=q5_k ssm_out=q5_k output=q6_k token_embd=q4_k
 
 # ---- 16 GB card
-AD-IQ4_XS-IQ3_S     | q8_0 | ffn_down=iq4_xs ffn_gate=iq3_s ffn_up=iq3_s attn_q=iq4_xs attn_gate=iq4_xs ssm_out=iq4_xs output=q5_k token_embd=q4_k
-AD-IQ3_S            | q8_0 | ffn_down=iq3_s ffn_gate=iq3_s ffn_up=iq3_s attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq4_xs output=q5_k token_embd=q4_k
-AD-IQ3_S-IQ3_XXS    | q8_0 | ffn_down=iq3_s ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq4_xs output=q5_k token_embd=iq4_xs
-AD-IQ3_XXS          | q8_0 | ffn_down=iq3_xxs ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq4_xs
+AD-IQ4_XS        | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q5_k blk\.([4-9]|1[01])\.ffn_.*=q4_k ffn_down=q4_k ffn_gate=iq4_xs ffn_up=iq4_xs attn_q=q4_k attn_gate=q4_k ssm_out=q4_k output=q6_k token_embd=q4_k
+AD-IQ4_XS-IQ3_S  | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=q4_k blk\.([4-9]|1[01])\.ffn_.*=iq4_xs ffn_down=iq4_xs ffn_gate=iq3_s ffn_up=iq3_s attn_q=q4_k attn_gate=iq4_xs ssm_out=iq4_xs output=q5_k token_embd=iq4_xs
+AD-IQ3_S         | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq4_xs blk\.([4-9]|1[01])\.ffn_.*=iq4_xs ffn_down=iq3_s ffn_gate=iq3_s ffn_up=iq3_s attn_q=iq4_xs attn_gate=iq4_xs ssm_out=iq4_xs output=q5_k token_embd=iq4_xs
 
 # ---- 12 GB card
-AD-IQ3_XXS-IQ2_S    | q8_0 | ffn_down=iq3_xxs ffn_gate=iq2_s ffn_up=iq2_s attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq3_xxs
-AD-IQ2_S            | q8_0 | ffn_down=iq2_s ffn_gate=iq2_s ffn_up=iq2_s attn_q=iq3_s attn_gate=iq3_s ssm_out=iq3_xxs output=q5_k token_embd=iq3_xxs
-AD-IQ2_S-IQ2_XS     | q8_0 | ffn_down=iq2_s ffn_gate=iq2_xs ffn_up=iq2_xs attn_q=iq3_s attn_gate=iq3_xxs ssm_out=iq3_xxs output=q4_k token_embd=iq3_xxs
-AD-IQ2_XS           | q8_0 | ffn_down=iq2_xs ffn_gate=iq2_xs ffn_up=iq2_xs attn_q=iq3_xxs attn_gate=iq2_s ssm_out=iq3_xxs output=q4_k token_embd=iq2_xxs
+AD-IQ3_S-IQ3_XXS | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq4_xs blk\.([4-9]|1[01])\.ffn_.*=iq3_s ffn_down=iq3_s ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq4_xs output=q5_k token_embd=iq4_xs
+AD-IQ3_XXS       | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq3_s blk\.([4-9]|1[01])\.ffn_.*=iq3_s ffn_down=iq3_xxs ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq4_xs
+AD-IQ2_S         | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq3_s blk\.([4-9]|1[01])\.ffn_.*=iq3_xxs ffn_down=iq2_s ffn_gate=iq2_s ffn_up=iq2_s attn_q=iq3_s attn_gate=iq3_s ssm_out=iq3_xxs output=q5_k token_embd=iq4_xs
 
 # ---- 8 to 10 GB
-AD-IQ2_XS-IQ2_XXS   | q8_0 | ffn_down=iq2_xs ffn_gate=iq2_xxs ffn_up=iq2_xxs attn_q=iq3_xxs attn_gate=iq2_s ssm_out=iq2_s output=q4_k token_embd=iq2_xxs
-AD-IQ2_XXS          | q8_0 | ffn_down=iq2_xxs ffn_gate=iq2_xxs ffn_up=iq2_xxs attn_q=iq2_s attn_gate=iq2_s ssm_out=iq2_s output=iq4_xs token_embd=iq2_xxs
-AD-IQ2_XXS-IQ1_M    | q8_0 | ffn_down=iq2_xxs ffn_gate=iq1_m ffn_up=iq1_m attn_q=iq2_s attn_gate=iq2_s ssm_out=iq2_s output=iq4_xs token_embd=iq2_xxs
-AD-IQ2_XXS-IQ1_S    | q8_0 | ffn_down=iq2_xxs ffn_gate=iq1_s ffn_up=iq1_s attn_q=iq2_s attn_gate=iq2_s ssm_out=iq2_s output=iq4_xs token_embd=iq2_xxs
+AD-IQ2_S-IQ2_XS  | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq3_xxs blk\.([4-9]|1[01])\.ffn_.*=iq2_s ffn_down=iq2_s ffn_gate=iq2_xs ffn_up=iq2_xs attn_q=iq3_s attn_gate=iq3_xxs ssm_out=iq3_xxs output=q4_k token_embd=iq4_xs
+AD-IQ2_XS        | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq3_xxs blk\.([4-9]|1[01])\.ffn_.*=iq2_s ffn_down=iq2_xs ffn_gate=iq2_xs ffn_up=iq2_xs attn_q=iq3_xxs attn_gate=iq2_s ssm_out=iq3_xxs output=q4_k token_embd=iq4_xs
+AD-IQ2_XXS       | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq2_s blk\.([4-9]|1[01])\.ffn_.*=iq2_xs ffn_down=iq2_xxs ffn_gate=iq2_xxs ffn_up=iq2_xxs attn_q=iq2_s attn_gate=iq2_s ssm_out=iq2_s output=iq4_xs token_embd=iq4_xs
+AD-IQ1_M         | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq2_xs blk\.([4-9]|1[01])\.ffn_.*=iq2_xxs ffn_down=iq2_xxs ffn_gate=iq1_m ffn_up=iq1_m attn_q=iq2_s attn_gate=iq2_s ssm_out=iq2_s output=iq4_xs token_embd=iq4_xs
+AD-IQ1_S         | q8_0 | blk\.([0-3]|5[2-9]|6[0-3])\.ffn_.*=iq2_xs blk\.([4-9]|1[01])\.ffn_.*=iq2_xxs ffn_down=iq2_xxs ffn_gate=iq1_s ffn_up=iq1_s attn_q=iq2_s attn_gate=iq2_s ssm_out=iq2_s output=iq4_xs token_embd=iq4_xs
 
-# ---- the standard mixes, same imatrix. People ask for these by name, and they
-# are the baseline that decides whether the layouts above actually win.
-Q6_K                | q6_k |
-Q5_K_M              | q5_k_m |
-Q4_K_M              | q4_k_m |
+# ---- stock mixes on the same imatrix, the baseline
+Q6_K             | q6_k |
+Q5_K_M           | q5_k_m |
+Q4_K_M           | q4_k_m |
 LADDEREOF
     echo "wrote /ladder.txt, $(grep -c '|' /ladder.txt) rungs"
     echo "check the sizes first:   ladder /ladder.txt --dry"
