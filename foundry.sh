@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.30
+FOUNDRY_VERSION=2026-08-14.31
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -219,7 +219,7 @@ selfcheck() {
              push_base push_logs push_results push_model push_model_split \
              push_card pull_logs get_imatrix get_calib wait_calib im_size \
              im_plan im_shard im_range im_merge im_merge_all im_stats \
-             im_status push_shards plan ls_main ls_metrics ls_corpora \
+             im_status push_shards push_quants plan ls_main ls_metrics ls_corpora \
              get_recipe use_gpus apply_gpus list_repo fetch_one \
              write_kld_readme send_base get_base; do
         type -t $f > /dev/null 2>&1 || missing="$missing $f"
@@ -265,7 +265,7 @@ MEASURE       get_eval | get_eval_set NAME | eval_size | set_ctx N | base
               bench MODEL | bench_all | gen MODEL NGL "EXTRA"
               results | pull_logs
 
-UPLOAD        push_base | push_logs | push_results | push_model FILE
+UPLOAD        push_base | push_logs | push_results | push_quants | push_model FILE
               push_model_split FILE | push_card FILE | send_base user@host PORT
 
 HELP_EOF
@@ -3048,6 +3048,38 @@ push_model() {
     fi
     ls -lh $1
     hf_put "$1" "$(basename $1)" "$MAIN" model
+}
+
+# Upload every quant on this box that is not in the repo yet. Idempotent, so
+# it is the fix for any upload that failed while the file itself is fine.
+push_quants() {
+    need_preset || return 1
+    token_check > /dev/null || return 1
+
+    local have f name
+    have=$(python3 - "$MAIN" << 'HAVEEOF'
+import sys
+from huggingface_hub import HfApi
+try:
+    for f in HfApi().list_repo_files(sys.argv[1]):
+        if f.endswith(".gguf"):
+            print(f)
+except Exception:
+    pass
+HAVEEOF
+)
+    for f in $(quant_files); do
+        name=$(basename "$f")
+        if echo "$have" | grep -qx "$name"; then
+            echo "already up: $name"
+            continue
+        fi
+        echo "$name  $(du -h "$f" | cut -f1)"
+        hf_put "$f" "$name" "$MAIN" model && echo "  up" || echo "  failed"
+    done
+    echo
+    echo "quants live in   $MAIN"
+    echo "kld and logs in  $METRICS"
 }
 
 push_model_split() {
