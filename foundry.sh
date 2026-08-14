@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.19
+FOUNDRY_VERSION=2026-08-14.20
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -197,7 +197,8 @@ selfcheck() {
              base kld kld_all bench bench_all gen results bits quantize \
              get_external autopush push_base push_logs push_results push_model \
              pull_logs get_imatrix get_calib wait_calib im_size im_plan \
-             im_shard im_range im_merge im_merge_all im_stats; do
+             im_shard im_range im_merge im_merge_all im_stats push_shards \
+             im_status; do
         type -t $f > /dev/null 2>&1 || MISSING="$MISSING $f"
     done
     if [ -n "$MISSING" ]; then
@@ -2071,6 +2072,52 @@ im_range() {
 
 # Merge whatever shards are present, whatever they are called. Use this after
 # rebalancing with im_range, when the names no longer follow I-of-N.
+# Upload every shard sitting in /imatrix that is not in the repo yet. Safe to
+# run as often as you like. Use it whenever a shard finished in a pane that had
+# an older copy of this file loaded and never got to its own upload line.
+push_shards() {
+    need_preset || return 1
+    local f name
+    for f in /imatrix/shard-*.gguf; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f")
+        echo "$name"
+        hf_put "$f" "imatrix/$name" "$METRICS" "$METRICS_KIND" \
+            && echo "  up" || echo "  failed"
+    done
+}
+
+# What is on this box, what is in the repo, and whether the chunk ranges cover
+# the corpus without a gap.
+im_status() {
+    need_preset || return 1
+    echo "on this box:"
+    ls -lh /imatrix/shard-*.gguf 2>/dev/null | awk '{print "  ", $9, $5}' || echo "   none"
+    echo
+    echo "in $METRICS:"
+    python3 - "$METRICS" "$METRICS_KIND" << 'IMSTEOF'
+import sys
+from huggingface_hub import HfApi
+repo, kind = sys.argv[1], sys.argv[2]
+try:
+    files = [f for f in HfApi().list_repo_files(repo, repo_type=kind)
+             if f.startswith("imatrix/shard-")]
+except Exception as e:
+    print("   cannot read the repo: %s" % str(e).splitlines()[0])
+    sys.exit(0)
+if not files:
+    print("   none yet")
+for f in sorted(files):
+    print("  ", f)
+print()
+print("%d shard(s) published" % len(files))
+IMSTEOF
+    echo
+    echo "chunk ranges are in the logs:"
+    grep -h "computing over\|removing initial" /logs/imatrix-shard-*.log 2>/dev/null \
+        | sed "s/^/  /" | tail -20
+}
+
 im_merge_all() {
     need_preset || return 1
     repo_ok || return 1
