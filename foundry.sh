@@ -13,9 +13,26 @@ export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
 
 BIN=/llama.cpp/build/bin
-EVAL=/eval/eval_neutral.txt
-BASE=/kld/base.kld
 CTX=4096
+
+# Which held-out set we measure on. Everything downstream is named after it,
+# so several sets can live side by side without overwriting each other.
+EVALSET=neutral
+EVAL=/eval/neutral.txt
+BASE=/kld/base-neutral.kld
+
+use_evalset() {
+    if [ -z "$1" ]; then
+        echo "use_evalset neutral | agentic | code       current: $EVALSET"
+        return 1
+    fi
+    EVALSET=$1
+    EVAL=/eval/$1.txt
+    BASE=/kld/base-$1.kld
+    echo "eval set  : $EVALSET"
+    echo "corpus    : $EVAL"
+    echo "reference : $BASE"
+}
 
 
 # ================================================================== presets
@@ -168,7 +185,10 @@ CALIBRATION CORPUS
                              Run this BEFORE building a corpus for a new model.
 
 DOWNLOAD, each one asks before pulling anything
-  get_eval                   the held-out corpus, placed at /eval automatically
+  get_eval                   the neutral held-out corpus
+  get_eval_set NAME          neutral | agentic | code. Switches every derived
+                             path, so sets never overwrite each other
+  use_evalset NAME           switch sets without downloading
   eval_size                  bytes, token estimate, chunk count at the current ctx
   set_ctx N                  change the evaluation context
   get_bf16                   the reference weights, sharded or not
@@ -184,7 +204,7 @@ BUILD A BF16 THAT DOES NOT EXIST YET   (Qwen case, not Nemotron)
   push_model_split FILE      publish it, split at 45 GB
 
 MEASURE
-  base                       write the reference into /kld/base.kld
+  base                       write the reference into /kld/base-<set>.kld
   kld MODEL                  one quant against the reference
   kld_all                    every .gguf in /gguf
   bench MODEL                llama-bench, GPU 0 only, json out
@@ -334,6 +354,13 @@ list_repo() {
 import sys
 from huggingface_hub import HfApi
 repo, kind = sys.argv[1], sys.argv[2]
+
+def human(n):
+    for unit, div in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if n >= div:
+            return "%.2f %s" % (n / div, unit)
+    return "%d B" % n
+
 try:
     tree = list(HfApi().list_repo_tree(repo, repo_type=kind, recursive=True))
 except Exception as e:
@@ -345,9 +372,9 @@ for f in sorted(tree, key=lambda x: x.path):
     if size is None:
         continue
     total += size
-    print("%10.2f GB  %s" % (size / 1e9, f.path))
+    print("%12s  %s" % (human(size), f.path))
 print("---")
-print("%10.2f GB  total, %d files" % (total / 1e9, len([f for f in tree if getattr(f, "size", None)])))
+print("%12s  total, %d files" % (human(total), len([f for f in tree if getattr(f, "size", None)])))
 LSEOF
 }
 
@@ -396,7 +423,7 @@ block("BF16 reference weights",
       todo)
 
 # --- kld base
-local_base = os.path.exists("/kld/base.kld")
+local_base = bool(glob.glob("/kld/base-*.kld"))
 remote_base = [f for f in (metric_files or []) if f.endswith(".kld")]
 if local_base:
     todo = "nothing, it is here"
@@ -407,7 +434,7 @@ elif local_bf16:
 else:
     todo = "get the bf16 first, then run: base"
 block("KLD reference (.kld)",
-      "yes, %.2f GB" % (os.path.getsize("/kld/base.kld") / 1e9) if local_base else "no",
+      "yes: %s" % ", ".join(os.path.basename(p) for p in glob.glob("/kld/base-*.kld")) if local_base else "no",
       ("%d in %s" % (len(remote_base), metrics)) if remote_base
         else ("metrics repo unreadable, check METRICS_KIND" if metric_files is None
               else "not in %s" % metrics),
@@ -536,16 +563,34 @@ get_recipe() {
 
 # ================================================================== download
 
-get_eval() {
+# Exact paths inside AtomicChat/calib-corpora. Globs are not safe here:
+# every set also has a *.manifest.jsonl next to it, which is not the corpus.
+get_eval_set() {
+    if [ -z "$1" ]; then
+        echo "get_eval_set neutral | agentic | code"
+        return 1
+    fi
+    case "$1" in
+        neutral) REMOTE=eval/neutral/eval_neutral.txt ;;
+        agentic) REMOTE=eval/agentic/eval_agentic.txt ;;
+        code)    REMOTE=eval/code/eval_code_full.txt ;;
+        *) echo "unknown set: $1. Run ls_corpora and pass an exact path instead."
+           return 1 ;;
+    esac
+
+    use_evalset $1
     if [ -f $EVAL ]; then
         echo "already here:"
-        ls -lh $EVAL
+        eval_size
         return 0
     fi
-    echo "Held-out eval corpus, from the AtomicChat/calib-corpora dataset."
     ask "download?" || return 1
-    fetch_one AtomicChat/calib-corpora dataset "*eval_neutral*" $EVAL || return 1
+    fetch_one AtomicChat/calib-corpora dataset "$REMOTE" $EVAL || return 1
     eval_size
+}
+
+get_eval() {
+    get_eval_set neutral
 }
 
 eval_size() {
@@ -638,8 +683,8 @@ get_one() {
 get_base() {
     need_preset || return 1
     hf download $METRICS --repo-type $METRICS_KIND --include "kld/*" --local-dir /kld
-    if [ -f /kld/kld/base.kld ]; then
-        mv /kld/kld/base.kld $BASE
+    if [ -f /kld/kld/base-$EVALSET.kld ]; then
+        mv /kld/kld/base-$EVALSET.kld $BASE
     fi
     ls -lh $BASE
 }
@@ -814,7 +859,7 @@ base() {
 
     $BIN/llama-perplexity -m $BF16_FIRST -f $EVAL \
         --kl-divergence-base $BASE -c $CTX -ngl 99 \
-        2>&1 | tee /logs/base.log
+        2>&1 | tee /logs/base-$EVALSET.log
 
     echo "took $(( $(date +%s) - START )) seconds"
     echo
@@ -829,12 +874,12 @@ kld() {
 
     NAME=$(basename $1 .gguf)
     echo "--------------------------------------------------"
-    echo "KLD: $NAME"
+    echo "KLD on $EVALSET: $NAME"
     START=$(date +%s)
 
     $BIN/llama-perplexity -m $1 -f $EVAL \
         --kl-divergence-base $BASE --kl-divergence -c $CTX -ngl 99 \
-        2>&1 | tee /logs/kld-$NAME.log
+        2>&1 | tee /logs/kld-$EVALSET--$NAME.log
 
     echo "took $(( $(date +%s) - START )) seconds"
 }
@@ -899,9 +944,13 @@ def num(pattern, text):
 out = {}
 
 for path in glob.glob('/logs/kld-*.log'):
-    name = os.path.basename(path)[4:-4]
+    stem = os.path.basename(path)[4:-4]
+    if '--' in stem:
+        evalset, name = stem.split('--', 1)
+    else:
+        evalset, name = 'neutral', stem
     text = open(path, errors='ignore').read()
-    row = out.setdefault(name, {'name': name})
+    row = out.setdefault((evalset, name), {'name': name, 'eval_set': evalset})
     row['mean_kld']   = num(r'Mean\s+KLD:\s+([0-9.]+)', text)
     row['q99_kld']    = num(r'99\.0%\s+KLD:\s+([0-9.]+)', text)
     row['median_kld'] = num(r'Median\s+KLD:\s+([0-9.]+)', text)
@@ -910,7 +959,7 @@ for path in glob.glob('/logs/kld-*.log'):
 
 for path in glob.glob('/logs/bench-*.json'):
     name = os.path.basename(path)[6:-5]
-    row = out.setdefault(name, {'name': name})
+    row = out.setdefault(('speed', name), {'name': name, 'eval_set': 'speed'})
     try:
         for entry in json.load(open(path)):
             key = 'pp512' if entry.get('n_prompt', 0) > 0 else 'tg128'
@@ -920,21 +969,21 @@ for path in glob.glob('/logs/bench-*.json'):
     except Exception as e:
         row['bench_error'] = str(e)
 
-for name, row in out.items():
+for key, row in out.items():
     for folder in ('/gguf', '/gguf/experimental'):
-        p = os.path.join(folder, name + '.gguf')
+        p = os.path.join(folder, row['name'] + '.gguf')
         if os.path.exists(p):
             row['size_bytes'] = os.path.getsize(p)
             row['size_gb'] = round(os.path.getsize(p) / 1e9, 2)
 
-rows = sorted(out.values(), key=lambda r: r.get('size_gb') or 0)
+rows = sorted(out.values(), key=lambda r: (r.get('eval_set') or '', r.get('size_gb') or 0))
 with open('/logs/results.json', 'w') as f:
     json.dump(rows, f, indent=2)
 
-print('%-50s %7s %10s %8s %8s' % ('file', 'GB', 'mean KLD', 'top-1', 'tg t/s'))
+print('%-9s %-44s %7s %10s %8s %8s' % ('set', 'file', 'GB', 'mean KLD', 'top-1', 'tg t/s'))
 for r in rows:
-    print('%-50s %7s %10s %8s %8s' % (
-        r['name'][:50],
+    print('%-9s %-44s %7s %10s %8s %8s' % (
+        r.get('eval_set', ''), r['name'][:44],
         r.get('size_gb', ''), r.get('mean_kld', ''),
         r.get('top1_pct', ''), r.get('tg128_tps', '')))
 print()
@@ -948,8 +997,8 @@ PYEOF
 push_base() {
     need_preset || return 1
     ls -lh $BASE
-    hf upload $METRICS --repo-type $METRICS_KIND $BASE kld/base.kld
-    hf upload $METRICS --repo-type $METRICS_KIND /logs/base.log logs/base.log
+    hf upload $METRICS --repo-type $METRICS_KIND $BASE kld/base-$EVALSET.kld
+    hf upload $METRICS --repo-type $METRICS_KIND /logs/base-$EVALSET.log logs/base-$EVALSET.log
     echo "Reference is up. The other box can pull it now."
 }
 
