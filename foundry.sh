@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.28
+FOUNDRY_VERSION=2026-08-14.29
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -2508,6 +2508,32 @@ quantize() {
     echo "publish it with:  push_model $QUANT_OUT"
 }
 
+# The list llama-quantize prints under "allowed quantization types" is for the
+# positional ftype argument. --tensor-type takes a ggml_type, and the two are
+# different sets: IQ2_M, IQ3_M, IQ3_XS, Q2_K_S, Q3_K_*, Q4_K_*, Q5_K_* are
+# mixes, recipes for which tensor gets which type, so they cannot be assigned
+# to a tensor. Passing one aborts the run after the model has been read.
+GGML_TYPES="f32 f16 bf16 q4_0 q4_1 q5_0 q5_1 q8_0 q2_k q3_k q4_k q5_k q6_k \
+iq1_s iq1_m iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_xs iq4_nl tq1_0 tq2_0 \
+mxfp4 q1_0 q2_0"
+
+check_types() {
+    local r t bad=""
+    for r in "$@"; do
+        case "$r" in *=*) t=${r#*=} ;; *) continue ;; esac
+        case " $GGML_TYPES " in
+            *" $t "*) ;;
+            *) bad="$bad $t" ;;
+        esac
+    done
+    if [ -n "$bad" ]; then
+        echo "not ggml types, cannot go in a --tensor-type rule:$bad"
+        echo "those are ftype mixes. Assignable types are:"
+        echo "  $GGML_TYPES" | fold -s -w 70 | sed "s/^/    /"
+        return 1
+    fi
+}
+
 # ladder FILE
 # One rung per line:   LABEL | FALLBACK | rule rule rule
 # Blank lines and lines starting with # are ignored.
@@ -2557,6 +2583,10 @@ ladder() {
         echo "  $rules"
         echo
 
+        if ! check_types $rules; then
+            bad=$(( bad + 1 ))
+            continue
+        fi
         bits $rules "*=$fallback" | tail -6
 
         [ -n "$dry" ] && continue
@@ -2591,32 +2621,31 @@ write_ladder() {
     cat > /ladder.txt << 'LADDEREOF'
 # Qwen3.8-27B. LABEL | FALLBACK | rules
 #
-# Naming follows the same rule as the Nemotron release: AD-<ffn_down>-<ffn_up>,
-# collapsed to one name when both match. The name carries the layout, so nobody
-# has to guess what is inside, and no file is named after a type it does not
-# contain. iq3_m and iq3_xs are ftype mixes, not tensor types, so they can
-# never appear in a rule.
+# Only ggml types appear in rules. IQ2_M, IQ3_M, IQ3_XS and the Q*_K_S/M/L
+# names are ftype mixes and cannot be assigned to a tensor, whatever the
+# "allowed quantization types" list suggests. That leaves a real gap between
+# iq2_s at 2.5 bpw and iq3_xxs at 3.06, which is why the rungs there move by
+# changing which group steps rather than by finding a type in between.
 #
-# ffn_down, ffn_gate and ffn_up are 21.2% each, 63.6% together, and set the
-# size. down carries more of the quality and sits one step above the other two
-# at almost every rung. A preset gives all three the same type; that asymmetry
-# is where these win at equal size.
+# Naming is AD-<ffn_down>-<ffn_up>, collapsed when both match, so the name
+# carries the layout and no file is named after a type it does not contain.
 #
-# attn_gate and ssm_out are 5.5% each. This is a hybrid model and those two are
-# 11% together, so they move with the rung instead of sitting at q8_0.
+# ffn_down, ffn_gate and ffn_up are 21.2% each and set the size. down carries
+# more of the quality and sits a step above the other two at most rungs; a
+# preset gives all three the same type.
+#
+# attn_gate and ssm_out are 5.5% each, 11% together on this hybrid, so they
+# move with the rung instead of sitting at q8_0.
 #
 # attn_k and attn_v are 0.3% each: q8_0 everywhere, it costs 0.05 bpw.
-#
-# output and token_embd weigh the same, 4.7%, and behave differently. The head
-# picks the next token and stays high. The embedding table is a lookup whose
-# error stays local to one token, so it drops fast at the bottom.
+# output stays high, token_embd drops fast: same weight, different sensitivity.
 
 # ---- above 24 GB
 AD-Q8_0             | q8_0 |
 AD-Q6_K             | q8_0 | ffn_down=q6_k ffn_gate=q6_k ffn_up=q6_k attn_q=q8_0 attn_gate=q6_k ssm_out=q8_0
+AD-Q6_K-Q5_K        | q8_0 | ffn_down=q6_k ffn_gate=q5_k ffn_up=q5_k attn_q=q6_k attn_gate=q5_k ssm_out=q6_k
 
 # ---- 32 GB card
-AD-Q6_K-Q5_K        | q8_0 | ffn_down=q6_k ffn_gate=q5_k ffn_up=q5_k attn_q=q6_k attn_gate=q5_k ssm_out=q6_k
 AD-Q5_K             | q8_0 | ffn_down=q5_k ffn_gate=q5_k ffn_up=q5_k attn_q=q5_k attn_gate=q5_k ssm_out=q6_k
 AD-Q5_K-Q4_K        | q8_0 | ffn_down=q5_k ffn_gate=q4_k ffn_up=q4_k attn_q=q5_k attn_gate=q4_k ssm_out=q5_k output=q6_k
 
@@ -2632,22 +2661,22 @@ AD-IQ3_S-IQ3_XXS    | q8_0 | ffn_down=iq3_s ffn_gate=iq3_xxs ffn_up=iq3_xxs attn
 AD-IQ3_XXS          | q8_0 | ffn_down=iq3_xxs ffn_gate=iq3_xxs ffn_up=iq3_xxs attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq4_xs
 
 # ---- 12 GB card
-AD-IQ3_XXS-IQ2_M    | q8_0 | ffn_down=iq3_xxs ffn_gate=iq2_m ffn_up=iq2_m attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq3_xxs
-AD-IQ2_M            | q8_0 | ffn_down=iq2_m ffn_gate=iq2_m ffn_up=iq2_m attn_q=iq3_s attn_gate=iq3_s ssm_out=iq3_xxs output=q5_k token_embd=iq3_xxs
-AD-IQ2_M-IQ2_S      | q8_0 | ffn_down=iq2_m ffn_gate=iq2_s ffn_up=iq2_s attn_q=iq3_s attn_gate=iq3_xxs ssm_out=iq3_xxs output=q4_k token_embd=iq3_xxs
-AD-IQ2_S-IQ2_XS     | q8_0 | ffn_down=iq2_s ffn_gate=iq2_xs ffn_up=iq2_xs attn_q=iq3_xxs attn_gate=iq2_m ssm_out=iq3_xxs output=q4_k token_embd=iq2_xxs
+AD-IQ3_XXS-IQ2_S    | q8_0 | ffn_down=iq3_xxs ffn_gate=iq2_s ffn_up=iq2_s attn_q=iq4_xs attn_gate=iq3_s ssm_out=iq3_s output=q5_k token_embd=iq3_xxs
+AD-IQ2_S            | q8_0 | ffn_down=iq2_s ffn_gate=iq2_s ffn_up=iq2_s attn_q=iq3_s attn_gate=iq3_s ssm_out=iq3_xxs output=q5_k token_embd=iq3_xxs
+AD-IQ2_S-IQ2_XS     | q8_0 | ffn_down=iq2_s ffn_gate=iq2_xs ffn_up=iq2_xs attn_q=iq3_s attn_gate=iq3_xxs ssm_out=iq3_xxs output=q4_k token_embd=iq3_xxs
+AD-IQ2_XS           | q8_0 | ffn_down=iq2_xs ffn_gate=iq2_xs ffn_up=iq2_xs attn_q=iq3_xxs attn_gate=iq2_s ssm_out=iq3_xxs output=q4_k token_embd=iq2_xxs
 
 # ---- 8 to 10 GB
-AD-IQ2_S-IQ2_XXS    | q8_0 | ffn_down=iq2_s ffn_gate=iq2_xxs ffn_up=iq2_xxs attn_q=iq3_xxs attn_gate=iq2_m ssm_out=iq2_m output=q4_k token_embd=iq2_xxs
-AD-IQ2_XXS          | q8_0 | ffn_down=iq2_xxs ffn_gate=iq2_xxs ffn_up=iq2_xxs attn_q=iq2_m attn_gate=iq2_s ssm_out=iq2_m output=iq4_xs token_embd=iq2_xxs
-AD-IQ2_XXS-IQ1_M    | q8_0 | ffn_down=iq2_xxs ffn_gate=iq1_m ffn_up=iq1_m attn_q=iq2_m attn_gate=iq2_s ssm_out=iq2_m output=iq4_xs token_embd=iq2_xxs
-AD-IQ2_XXS-IQ1_S    | q8_0 | ffn_down=iq2_xxs ffn_gate=iq1_s ffn_up=iq1_s attn_q=iq2_m attn_gate=iq2_s ssm_out=iq2_m output=iq4_xs token_embd=iq2_xxs
+AD-IQ2_XS-IQ2_XXS   | q8_0 | ffn_down=iq2_xs ffn_gate=iq2_xxs ffn_up=iq2_xxs attn_q=iq3_xxs attn_gate=iq2_s ssm_out=iq2_s output=q4_k token_embd=iq2_xxs
+AD-IQ2_XXS          | q8_0 | ffn_down=iq2_xxs ffn_gate=iq2_xxs ffn_up=iq2_xxs attn_q=iq2_s attn_gate=iq2_s ssm_out=iq2_s output=iq4_xs token_embd=iq2_xxs
+AD-IQ2_XXS-IQ1_M    | q8_0 | ffn_down=iq2_xxs ffn_gate=iq1_m ffn_up=iq1_m attn_q=iq2_s attn_gate=iq2_s ssm_out=iq2_s output=iq4_xs token_embd=iq2_xxs
+AD-IQ2_XXS-IQ1_S    | q8_0 | ffn_down=iq2_xxs ffn_gate=iq1_s ffn_up=iq1_s attn_q=iq2_s attn_gate=iq2_s ssm_out=iq2_s output=iq4_xs token_embd=iq2_xxs
 
-# ---- the standard mixes, built with the same imatrix. People ask for these by
-# name, and they are also the honest baseline: same calibration, stock layout.
+# ---- the standard mixes, same imatrix. People ask for these by name, and they
+# are the baseline that decides whether the layouts above actually win.
 Q6_K                | q6_k |
-Q5_K_M              | q5_k |
-Q4_K_M              | q4_k |
+Q5_K_M              | q5_k_m |
+Q4_K_M              | q4_k_m |
 LADDEREOF
     echo "wrote /ladder.txt, $(grep -c '|' /ladder.txt) rungs"
     echo "check the sizes first:   ladder /ladder.txt --dry"
