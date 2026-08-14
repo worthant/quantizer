@@ -104,8 +104,18 @@ get_tools() {
 
 # The single definition of "a file we measure". Everything else in /gguf is a
 # reference, a drafter, or the imatrix, and none of those are quants.
+# Files we publish and stand behind. Anything under experimental/ is off by
+# default: set INCLUDE_EXPERIMENTAL=1 to measure those too, which you want when
+# the published card quotes numbers for them.
+INCLUDE_EXPERIMENTAL=0
+
 quant_files() {
-    find /gguf -maxdepth 2 -name "*.gguf" 2>/dev/null \
+    if [ "$INCLUDE_EXPERIMENTAL" = "1" ]; then
+        DEPTH=2
+    else
+        DEPTH=1
+    fi
+    find /gguf -maxdepth $DEPTH -name "*.gguf" 2>/dev/null \
         | grep -v -i "bf16" \
         | grep -v "/dflash-" \
         | grep -v "/dspark-" \
@@ -141,6 +151,7 @@ BASE=$BASE
 CTX=$CTX
 GPUS=$GPUS
 AUTOPUSH=$AUTOPUSH
+INCLUDE_EXPERIMENTAL=$INCLUDE_EXPERIMENTAL
 IM_MODEL=$IM_MODEL
 IM_CORPUS=$IM_CORPUS
 IM_CTX=$IM_CTX
@@ -406,6 +417,7 @@ DOWNLOAD, each one asks before pulling anything
   get_base                   pull an existing reference from the metrics repo
   find_bf16                  locate the bf16 file already on disk
   quant_files                list exactly what will be measured, nothing else
+  INCLUDE_EXPERIMENTAL=1     also measure everything under /gguf/experimental
 
 BUILD A BF16 THAT DOES NOT EXIST YET   (Qwen case, not Nemotron)
   get_upstream               original safetensors from UPSTREAM into /src
@@ -1199,6 +1211,10 @@ from huggingface_hub import hf_hub_download
 
 name, repo = sys.argv[1], sys.argv[2]
 
+# build.py maps chat.format onto a renderer module through its FORMATTERS dict,
+# so this has to be a short key with a matching <key>_fmt.py, not the full name.
+fmt_key = re.match(r"[a-z]+", name).group(0) if re.match(r"[a-z]+", name) else name
+
 def grab(fn):
     try:
         return open(hf_hub_download(repo, fn), encoding="utf-8").read()
@@ -1317,7 +1333,10 @@ model:
 seed: 20260814
 
 chat:
-  format: {name}
+  # build.py resolves this through FORMATTERS to tools/{fmt}_fmt.py.
+  # That module must exist and be registered there, or the build falls back
+  # to the default renderer and emits another model's markup.
+  format: {fmt}
   add_bos_per_document: {add_bos}
 {date_pin}
 calib_train:
@@ -1354,7 +1373,7 @@ notes:
     chat markup in calib_train.txt is tokenised as literal punctuation and the
     agentic and reasoning slices calibrate on text the model never sees.
 """.format(
-    repo=repo, name=name, vocab=vocab, layers=layers, ctxlen=ctxlen,
+    repo=repo, name=name, fmt=fmt_key, vocab=vocab, layers=layers, ctxlen=ctxlen,
     window="null" if window is None else window,
     add_bos="true" if add_bos else "false",
     code=code_share, reason=reasoning_share, lctx=longctx_share,
@@ -1374,7 +1393,12 @@ out = "/recipes/%s.yaml" % name
 open(out, "w").write(body)
 print()
 print("wrote %s" % out)
-print("read it once, adjust the shares if this model is not what the comments assume")
+print()
+print("two things this file cannot do for you:")
+print("  1. tools/%s_fmt.py must exist and be registered in FORMATTERS in" % fmt_key)
+print("     build.py, or the build renders with another model's markup")
+print("  2. the domain shares are a claim about what this model is for.")
+print("     Read them once.")
 RECIPEEOF
 }
 
