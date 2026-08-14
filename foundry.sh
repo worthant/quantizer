@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.35
+FOUNDRY_VERSION=2026-08-14.37
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -1386,6 +1386,11 @@ kld() {
     if [ ! -f $BASE ]; then echo "no reference at $BASE. Run base, or get_base."; return 1; fi
 
     NAME=$(basename $1 .gguf)
+    case "$1" in
+        /gguf/external/*)
+            # /gguf/external/<org>/<file>.gguf -> <org>--<file>
+            NAME=$(echo "$1" | sed "s|/gguf/external/||; s|/|--|; s|\.gguf$||") ;;
+    esac
     apply_gpus
     echo "--------------------------------------------------"
     echo "KLD on $EVALSET: $NAME   (GPUs: $GPUS)"
@@ -1454,15 +1459,22 @@ catch_up() {
 # figures are not usable directly, only their files are.
 kld_ext() {
     local f n=0 total
-    total=$(ls /gguf/external/*.gguf 2>/dev/null | wc -l)
+    # mmproj is a vision projector and mtp is a draft head. Neither is a
+    # quantization of the model and neither can be measured against it.
+    ext_files() {
+        find /gguf/external -name "*.gguf" 2>/dev/null \
+            | grep -v "/mmproj-" | grep -v "/mtp-" \
+            | grep -v -i "bf16" | sort
+    }
+    total=$(ext_files | wc -l)
     if [ "$total" = "0" ]; then
-        echo "nothing in /gguf/external. Pull some with:"
+        echo "nothing measurable in /gguf/external. Pull some with:"
         echo "  get_external unsloth/Qwen3.8-27B-GGUF '*UD-IQ3_XXS*'"
         return 1
     fi
     local todo="" name
-    for f in /gguf/external/*.gguf; do
-        name=$(basename "$f" .gguf)
+    for f in $(ext_files); do
+        name=$(echo "$f" | sed "s|/gguf/external/||; s|/|--|; s|\.gguf$||")
         if [ -f "/logs/kld-$EVALSET--$name.log" ] && [ "$KLD_FORCE" != "1" ]; then
             echo "already measured: $name"
             continue
@@ -2863,17 +2875,23 @@ LADDEREOF
 
 # Pull somebody else's build so it can be measured against the same reference.
 # Comparisons across different references mean nothing.
+# Every publisher names their files the same way, so they go in separate
+# directories or they overwrite each other and the measurement belongs to
+# whoever downloaded last, with nothing in the log to say who.
 get_external() {
     if [ -z "$2" ]; then
         echo "get_external REPO PATTERN"
-        echo "  get_external ggml-org/Some-Model-GGUF '*NVFP4*'"
+        echo "  get_external unsloth/Qwen3.8-27B-GGUF '*UD-IQ3_XXS*'"
         return 1
     fi
-    mkdir -p /gguf/external
-    hf download $1 --include "$2" --local-dir /gguf/external
-    ls -la /gguf/external
+    local org dest
+    org=$(echo "$1" | cut -d/ -f1)
+    dest=/gguf/external/$org
+    mkdir -p "$dest"
+    hf download "$1" --include "$2" --local-dir "$dest"
+    ls -la "$dest"/*.gguf 2>/dev/null
     echo
-    echo "measure it with:  kld /gguf/external/<file>.gguf"
+    echo "measured as $org--<file>, so the publisher is in the log name"
 }
 
 
@@ -2925,12 +2943,37 @@ for path in glob.glob('/logs/bench-*.json'):
     except Exception as e:
         r['bench_error'] = str(e)
 
-for name, r in rows.items():
-    for folder in ('/gguf', '/gguf/experimental', '/gguf/external'):
-        p = os.path.join(folder, name + '.gguf')
+# Other publishers all name their files identically, so each one lives under
+# /gguf/external/<publisher>/ and is logged as <publisher>--<file>. The path
+# has to be rebuilt from that or the row ends up with no size, and a row with
+# no size cannot be placed on a size axis.
+def find_file(name):
+    cands = [os.path.join('/gguf', name + '.gguf'),
+             os.path.join('/gguf/experimental', name + '.gguf'),
+             os.path.join('/gguf/external', name + '.gguf')]
+    if '--' in name:
+        org, base = name.split('--', 1)
+        cands.append('/gguf/external/%s/%s.gguf' % (org, base))
+    cands += glob.glob('/gguf/external/*/%s.gguf' % name)
+    for p in cands:
         if os.path.exists(p):
-            r['size_bytes'] = os.path.getsize(p)
-            r['size_gb'] = round(os.path.getsize(p) / 1e9, 2)
+            return p
+    return None
+
+for name, r in rows.items():
+    p = find_file(name)
+    if p:
+        r['size_bytes'] = os.path.getsize(p)
+        r['size_gb'] = round(os.path.getsize(p) / 1e9, 2)
+    if 'UD-' in name or name.startswith('unsloth--'):
+        r['publisher'] = 'unsloth'
+    elif 'AD-' in name:
+        r['publisher'] = 'atomicchat'
+    elif p and p.startswith('/gguf/external/'):
+        parts = p.split('/')
+        r['publisher'] = parts[3] if len(parts) > 4 else 'external'
+    else:
+        r['publisher'] = 'atomicchat'
 
 out = sorted(rows.values(), key=lambda r: r.get('size_gb') or 0)
 for r in out:
@@ -2955,6 +2998,14 @@ for r in out:
 if len(sets) > 1:
     print()
     print('eval sets in the file: %s (table shows %s)' % (', '.join(sets), primary))
+nosize = [r for r in out if not r.get('size_gb')]
+if nosize:
+    print()
+    print('%d row(s) have no size on this box, so they cannot be plotted yet:' % len(nosize))
+    for r in nosize:
+        print('   ', r['name'])
+    print('the file lives on another box. Run results there too, then merge_results.')
+
 if failed:
     print()
     print('%d run(s) produced no KLD, left out:' % len(failed))
