@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.33
+FOUNDRY_VERSION=2026-08-14.34
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -2516,6 +2516,18 @@ quantize() {
     STEM=$(basename $MAIN | sed "s/-GGUF//")
     QUANT_OUT=/gguf/$STEM-$LABEL.gguf
 
+    # Pin the MTP block unless the caller already said something about it.
+    local mtp
+    case "$*" in
+        *blk*) ;;
+        *) mtp=$(find_mtp_block)
+           if [ -n "$mtp" ]; then
+               echo "pinning the MTP block blk.$mtp to $MTP_TYPE: it collects no"
+               echo "imatrix data, so a low bit type would abort the run"
+               set -- --tensor-type "blk\.$mtp\.=$MTP_TYPE" "$@"
+           fi ;;
+    esac
+
     IM=""
     if [ -f /imatrix/imatrix.gguf ]; then
         IM="--imatrix /imatrix/imatrix.gguf"
@@ -2531,10 +2543,19 @@ quantize() {
 
     stdbuf -oL -eL $BIN/llama-quantize $IM "$@" $BF16_FIRST $QUANT_OUT $FTYPE $(nproc) \
         2>&1 | tee /logs/quantize-$LABEL.log
+    local rc=${PIPESTATUS[0]}
 
     echo "took $(( $(date +%s) - START )) seconds"
-    ls -lh $QUANT_OUT
     autopush /logs/quantize-$LABEL.log logs/quantize-$LABEL.log
+
+    if [ "$rc" != "0" ]; then
+        echo "quantize failed. Removing the partial file so nothing downstream"
+        echo "tries to load it:"
+        ls -lh $QUANT_OUT 2>/dev/null
+        rm -f $QUANT_OUT
+        return 1
+    fi
+    ls -lh $QUANT_OUT
     echo
     echo "publish it with:  push_model $QUANT_OUT"
 }
@@ -2547,6 +2568,29 @@ quantize() {
 GGML_TYPES="f32 f16 bf16 q4_0 q4_1 q5_0 q5_1 q8_0 q2_k q3_k q4_k q5_k q6_k \
 iq1_s iq1_m iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_xs iq4_nl tq1_0 tq2_0 \
 mxfp4 q1_0 q2_0"
+
+# A multi token prediction head is never executed in a normal forward pass, so
+# the imatrix has no statistics for it at any corpus size. Assign it a low bit
+# type and llama-quantize refuses outright, halfway through, leaving a
+# truncated file behind. Find it and pin it.
+find_mtp_block() {
+    find_bf16 > /dev/null 2>&1 || return 1
+    python3 - "$BF16_FIRST" << 'MTPEOF'
+import re, sys
+sys.path.insert(0, "/llama.cpp/gguf-py")
+from gguf import GGUFReader
+blocks = set()
+for t in GGUFReader(sys.argv[1]).tensors:
+    m = re.match(r"blk\.(\d+)\.nextn\.", t.name)
+    if m:
+        blocks.add(int(m.group(1)))
+print(max(blocks) if blocks else "")
+MTPEOF
+}
+
+# Type the MTP block gets. It is one block out of many, so keeping it high
+# costs almost nothing and it cannot be calibrated anyway.
+MTP_TYPE=${MTP_TYPE:-q5_k}
 
 check_types() {
     local r t bad=""
