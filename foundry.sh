@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.23
+FOUNDRY_VERSION=2026-08-14.24
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -213,7 +213,7 @@ selfcheck() {
              new_model pick_model get_eval get_eval_set eval_size get_bf16 \
              get_quants get_one find_bf16 quant_files get_upstream make_bf16 \
              base kld kld_all bench bench_all gen results bits quantize \
-             get_external kld_ext autopush push_base push_logs push_results push_model \
+             get_external kld_ext ladder autopush push_base push_logs push_results push_model \
              pull_logs get_imatrix get_calib wait_calib im_size im_plan \
              im_shard im_range im_merge im_merge_all im_stats push_shards \
              im_status hf_put_dir; do
@@ -287,6 +287,8 @@ QUANTIZE
   bits                       what each tensor group weighs, and its divisibility
   bits 'RULE' 'RULE'         predict the size before spending the time
   quantize LABEL TYPE ...    llama-quantize with the merged imatrix
+  ladder FILE                quantize, measure and publish every rung in a file
+  ladder FILE --dry          only predict the sizes, run this first
   get_external REPO PATTERN  someone else's build, measured on our reference
   kld_ext                    measure everything in /gguf/external on our base
 
@@ -2499,6 +2501,63 @@ quantize() {
     autopush /logs/quantize-$LABEL.log logs/quantize-$LABEL.log
     echo
     echo "publish it with:  push_model $QUANT_OUT"
+}
+
+# ladder FILE
+# One rung per line:   LABEL | FALLBACK | rule rule rule
+# Blank lines and lines starting with # are ignored.
+#
+# For each rung: predict the size, quantize, measure against the reference,
+# publish the file, and move on. Split the file across boxes to run in
+# parallel; nothing here depends on another rung.
+ladder() {
+    if [ -z "$1" ]; then
+        echo "ladder FILE       run every rung in it"
+        echo "ladder FILE --dry  only predict the sizes"
+        return 1
+    fi
+    if [ ! -f "$1" ]; then
+        echo "no such file: $1"
+        return 1
+    fi
+    need_preset || return 1
+    find_bf16 || return 1
+
+    local line label fallback rules args r dry=""
+    [ "$2" = "--dry" ] && dry=1
+
+    while IFS= read -r line; do
+        case "$line" in ""|\#*) continue ;; esac
+        label=$(echo "$line" | cut -d'|' -f1 | tr -d ' ')
+        fallback=$(echo "$line" | cut -d'|' -f2 | tr -d ' ')
+        rules=$(echo "$line" | cut -d'|' -f3-)
+
+        echo
+        echo "=================================================="
+        echo "$label   fallback $fallback"
+        echo "  $rules"
+        echo
+
+        bits $rules "*=$fallback" | tail -6
+
+        [ -n "$dry" ] && continue
+
+        args=""
+        for r in $rules; do
+            args="$args --tensor-type $r"
+        done
+        quantize "$label" "$fallback" $args || continue
+
+        local stem out
+        stem=$(basename $MAIN | sed "s/-GGUF//")
+        out=/gguf/$stem-$label.gguf
+        [ -f "$out" ] || continue
+
+        kld "$out"
+        push_model "$out"
+    done < "$1"
+
+    results
 }
 
 # Pull somebody else's build so it can be measured against the same reference.
