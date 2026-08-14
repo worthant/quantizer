@@ -159,8 +159,18 @@ BOX SETUP
   build 120                  compile. 120 blackwell, 90 hopper, 89 ada, 86 ampere
   gpu_test                   does ggml actually see the GPUs
 
+CALIBRATION CORPUS
+  ls_corpora                 what is in AtomicChat/calib-corpora
+  get_recipe NAME            pull a recipe yaml and print it
+  corpus_check DIR_OR_REPO   render the model chat template against system,
+                             user, assistant, tool_call and tool_response, then
+                             check every emitted marker is a real single token.
+                             Run this BEFORE building a corpus for a new model.
+
 DOWNLOAD, each one asks before pulling anything
-  get_eval                   the held-out corpus
+  get_eval                   the held-out corpus, placed at /eval automatically
+  eval_size                  bytes, token estimate, chunk count at the current ctx
+  set_ctx N                  change the evaluation context
   get_bf16                   the reference weights, sharded or not
   get_quants                 every published quant, no bf16, no sidecars
   get_one "PATTERN"          one file by glob
@@ -450,23 +460,127 @@ make_bf16() {
 }
 
 
+# ================================================================== fetching one file
+
+# fetch_one REPO KIND REMOTE_PATTERN DEST
+# Matches against the FULL path inside the repo and against the bare filename,
+# prints exactly what it found and where it put it, then places the file itself.
+fetch_one() {
+    python3 - "$1" "$2" "$3" "$4" << 'FETCHEOF'
+import fnmatch, os, shutil, sys
+from huggingface_hub import HfApi, hf_hub_download
+
+repo, kind, pattern, dest = sys.argv[1:5]
+
+try:
+    files = HfApi().list_repo_files(repo, repo_type=kind)
+except Exception as e:
+    print("cannot read %s (%s): %s" % (repo, kind, e))
+    sys.exit(1)
+
+hits = [f for f in files
+        if fnmatch.fnmatch(f, pattern) or fnmatch.fnmatch(os.path.basename(f), pattern)]
+
+if not hits:
+    print("nothing in %s matches %r" % (repo, pattern))
+    print("the repo contains:")
+    for f in sorted(files)[:60]:
+        print("   ", f)
+    sys.exit(1)
+
+sizes = {}
+try:
+    for entry in HfApi().list_repo_tree(repo, repo_type=kind, recursive=True):
+        s = getattr(entry, "size", None)
+        if s is not None:
+            sizes[entry.path] = s
+except Exception:
+    pass
+
+hits.sort(key=lambda f: sizes.get(f, 0), reverse=True)
+
+if len(hits) > 1:
+    print("%d files match %r, taking the BIGGEST:" % (len(hits), pattern))
+    for f in hits:
+        mark = " <-- taking this" if f == hits[0] else ""
+        print("   %8.2f MB  %s%s" % (sizes.get(f, 0) / 1e6, f, mark))
+
+src_path = hits[0]
+print()
+print("  from : %s :: %s" % (repo, src_path))
+print("  to   : %s" % dest)
+print()
+
+cached = hf_hub_download(repo, src_path, repo_type=kind)
+os.makedirs(os.path.dirname(dest), exist_ok=True)
+shutil.copyfile(cached, dest)
+print("placed, %.2f MB" % (os.path.getsize(dest) / 1e6))
+FETCHEOF
+}
+
+ls_corpora() {
+    list_repo AtomicChat/calib-corpora dataset
+}
+
+get_recipe() {
+    if [ -z "$1" ]; then
+        echo "get_recipe NAME       e.g. get_recipe nemotron-3.5-lightning"
+        echo "see what exists with: ls_corpora"
+        return 1
+    fi
+    fetch_one AtomicChat/calib-corpora dataset "*$1*.yaml" /eval/recipe.yaml
+    echo
+    cat /eval/recipe.yaml
+}
+
+
 # ================================================================== download
 
 get_eval() {
     if [ -f $EVAL ]; then
         echo "already here:"
-        wc -c $EVAL
+        ls -lh $EVAL
         return 0
     fi
-    ask "download the eval corpus?" || return 1
-    hf download AtomicChat/calib-corpora --repo-type dataset \
-        --include "eval_neutral.txt" --local-dir /eval
+    echo "Held-out eval corpus, from the AtomicChat/calib-corpora dataset."
+    ask "download?" || return 1
+    fetch_one AtomicChat/calib-corpora dataset "*eval_neutral*" $EVAL || return 1
+    eval_size
+}
+
+eval_size() {
     if [ ! -f $EVAL ]; then
-        find /eval -name "eval_neutral.txt"
-        echo "Not at $EVAL. Move it there."
+        echo "no corpus at $EVAL"
         return 1
     fi
-    wc -c $EVAL
+    BYTES=$(stat -c %s $EVAL)
+    TOKENS=$(( BYTES / 4 ))
+    CHUNKS=$(( TOKENS / CTX ))
+    echo
+    echo "corpus : $EVAL"
+    echo "size   : $BYTES bytes, roughly $TOKENS tokens"
+    echo "at ctx $CTX that is about $CHUNKS chunks"
+    if [ $CHUNKS -lt 2 ]; then
+        echo
+        echo "TOO SMALL. llama-perplexity needs at least two full contexts."
+        echo "Either you grabbed the wrong file (run ls_corpora and look), or"
+        echo "lower the context with set_ctx."
+        return 1
+    fi
+    if [ $CHUNKS -lt 20 ]; then
+        echo
+        echo "That is a thin sample. Error bars on the mean KLD will be wide."
+    fi
+}
+
+set_ctx() {
+    if [ -z "$1" ]; then
+        echo "set_ctx 4096      current: $CTX"
+        return 1
+    fi
+    CTX=$1
+    echo "context is now $CTX"
+    eval_size
 }
 
 find_bf16() {
@@ -531,6 +645,155 @@ get_base() {
 }
 
 
+# ================================================================== corpus validation
+
+# corpus_check DIR_OR_REPO
+# Renders the model's own chat template against a conversation that uses every
+# construct we calibrate on, then checks that every marker the template emits
+# is a real single token in the vocabulary. If it is not, that part of the
+# corpus calibrates nothing and the imatrix is quietly wrong.
+corpus_check() {
+    if [ -z "$1" ]; then
+        echo "corpus_check /src                          local original weights"
+        echo "corpus_check nvidia/Some-Model-BF16        straight from the hub"
+        return 1
+    fi
+    pip install --break-system-packages -q -U jinja2 >/dev/null 2>&1
+    python3 - "$1" << 'CHECKEOF'
+import json, os, re, sys
+
+target = sys.argv[1]
+
+def load(name):
+    if os.path.isdir(target):
+        p = os.path.join(target, name)
+        return open(p, encoding="utf-8").read() if os.path.exists(p) else None
+    from huggingface_hub import hf_hub_download
+    try:
+        return open(hf_hub_download(target, name), encoding="utf-8").read()
+    except Exception:
+        return None
+
+cfg_raw = load("tokenizer_config.json")
+if cfg_raw is None:
+    print("FAIL  no tokenizer_config.json at %s" % target)
+    sys.exit(1)
+cfg = json.loads(cfg_raw)
+
+template = load("chat_template.jinja")
+where = "chat_template.jinja"
+if template is None:
+    template = cfg.get("chat_template")
+    where = "tokenizer_config.json"
+if isinstance(template, list):
+    template = template[0].get("template")
+
+if not template:
+    print("FAIL  no chat template anywhere. The corpus cannot be rendered")
+    print("      the way the model actually sees text.")
+    sys.exit(1)
+print("ok    chat template found in %s, %d chars" % (where, len(template)))
+
+# every construct we calibrate on
+convo = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What is the weather in Paris?"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"type": "function", "function": {"name": "get_weather",
+         "arguments": '{"city": "Paris"}'}}]},
+    {"role": "tool", "content": '{"temp_c": 19}'},
+    {"role": "assistant", "content": "It is 19 degrees in Paris."},
+]
+tools = [{"type": "function", "function": {
+    "name": "get_weather",
+    "description": "Get the weather for a city",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                   "required": ["city"]}}}]
+
+from jinja2 import Environment
+from jinja2.exceptions import TemplateError
+env = Environment(trim_blocks=True, lstrip_blocks=True)
+env.policies["json.dumps_kwargs"] = {"ensure_ascii": False}
+try:
+    tpl = env.from_string(template)
+except Exception as e:
+    print("FAIL  the template does not even parse as jinja: %s" % e)
+    sys.exit(1)
+
+rendered = None
+for kwargs in (
+    {"messages": convo, "tools": tools, "add_generation_prompt": True},
+    {"messages": convo, "add_generation_prompt": True},
+    {"messages": convo[:2] + convo[4:], "add_generation_prompt": True},
+):
+    try:
+        rendered = tpl.render(bos_token="", eos_token="", **kwargs)
+        keys = ", ".join(k for k in kwargs if k != "messages")
+        print("ok    renders with: %s" % (keys or "messages only"))
+        break
+    except (TemplateError, Exception) as e:
+        print("      render failed with %s: %s" % (list(kwargs), e))
+
+if rendered is None:
+    print("FAIL  the template will not render any of our conversations")
+    sys.exit(1)
+
+if "tool" not in rendered.lower():
+    print("warn  the rendered text has no trace of the tool call. Either the")
+    print("      template ignores tools, or it wants a different message shape.")
+    print("      Agentic and tool data in the corpus will not exercise it.")
+
+# which markers does it emit, and are they real tokens
+markers = sorted(set(re.findall(r"<\|[^|>]{1,40}\|>|<[a-z_]{2,20}>|\[/?[A-Z_]{2,20}\]", rendered)))
+if not markers:
+    print("warn  the template emits no special markers at all, unusual")
+
+
+known = set()
+for v in (cfg.get("added_tokens_decoder") or {}).values():
+    if isinstance(v, dict) and "content" in v:
+        known.add(v["content"])
+tok_raw = load("tokenizer.json")
+if tok_raw:
+    try:
+        for a in json.loads(tok_raw).get("added_tokens", []):
+            known.add(a["content"])
+    except Exception:
+        pass
+add_raw = load("added_tokens.json")
+if add_raw:
+    try:
+        known.update(json.loads(add_raw).keys())
+    except Exception:
+        pass
+
+print()
+print("markers the template emits, and whether they are single tokens:")
+bad = []
+for m in markers:
+    if m in known:
+        print("  ok    %s" % m)
+    else:
+        print("  BAD   %s   not in the vocabulary" % m)
+        bad.append(m)
+
+print()
+if bad:
+    print("RESULT  %d markers are not real tokens." % len(bad))
+    print("        They will tokenize as literal punctuation, several tokens each,")
+    print("        and that part of the corpus calibrates nothing useful.")
+    print("        Fix the corpus rendering before running llama-imatrix.")
+else:
+    print("RESULT  every marker is a real single token.")
+    print("        Run llama-imatrix with --parse-special or all of this is wasted.")
+print()
+print("first 600 chars of the rendered conversation, eyeball it:")
+print("-" * 60)
+print(rendered[:600])
+CHECKEOF
+}
+
+
 # ================================================================== measure
 
 base() {
@@ -540,8 +803,12 @@ base() {
         echo "no corpus at $EVAL. Run get_eval."
         return 1
     fi
+    eval_size || return 1
 
+    echo
     echo "Writing the reference. All GPUs. Expect 4 to 8 minutes."
+    echo "Warnings about unused blk.52.nextn tensors are normal: that is the MTP"
+    echo "block, which a plain forward pass never executes."
     date
     START=$(date +%s)
 
