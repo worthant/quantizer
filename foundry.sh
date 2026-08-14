@@ -9,11 +9,48 @@
 # Nothing runs in the background. Every function says what it is doing,
 # checks its inputs, and stops loudly when something is missing.
 
-# Bump this on every change. reload prints it, so a stale copy is obvious.
-FOUNDRY_VERSION=2026-08-14.12
+# Bump this on every change. reload compares it against what is on github.
+FOUNDRY_VERSION=2026-08-14.14
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
+
+# raw.githubusercontent.com is served through a CDN that caches for minutes, so
+# a plain curl right after a push returns 200 with the previous file. The API
+# endpoint reads the repository directly and is not cached that way.
+#
+# This function cannot honestly report its own result either: by the time the
+# new file is sourced, any message it prints still comes from the copy that was
+# already running. So it inspects the download BEFORE replacing anything.
+reload() {
+    TMP=/tmp/foundry.new
+    curl -sL -H "Accept: application/vnd.github.raw" \
+        https://api.github.com/repos/worthant/quantizer/contents/foundry.sh \
+        -o $TMP || { echo "download failed, keeping the current copy"; return 1; }
+
+    if ! head -1 $TMP | grep -q "^#!"; then
+        echo "what came back is not a script:"
+        head -3 $TMP
+        return 1
+    fi
+
+    GOT=$(grep -m1 "^FOUNDRY_VERSION=" $TMP | cut -d= -f2)
+    echo "here: ${FOUNDRY_VERSION:-unknown}    on github: ${GOT:-none}"
+
+    if [ -z "$GOT" ]; then
+        echo "the copy on github has no version line, so it is older than this."
+        echo "your push has not landed at main/foundry.sh."
+        return 1
+    fi
+    if [ "$GOT" = "$FOUNDRY_VERSION" ]; then
+        echo "same version, nothing to do"
+        return 0
+    fi
+
+    mv $TMP /foundry.sh
+    source /foundry.sh
+    echo "now running $FOUNDRY_VERSION"
+}
 
 BIN=/llama.cpp/build/bin
 STATE=/state.sh
@@ -1362,11 +1399,21 @@ im_size() {
         return 1
     fi
     BYTES=$(stat -c %s $IM_CORPUS)
-    IM_TOKENS=$(( BYTES / 4 ))
+    if [ -n "$IM_TOKENS_EXACT" ]; then
+        IM_TOKENS=$IM_TOKENS_EXACT
+        SOURCE="exact, from the build log"
+    else
+        IM_TOKENS=$(( BYTES / 4 ))
+        SOURCE="estimated at 4 bytes per token, usually low"
+    fi
     IM_CHUNKS=$(( IM_TOKENS / IM_CTX ))
     echo "corpus  : $IM_CORPUS"
-    echo "size    : $BYTES bytes, roughly $IM_TOKENS tokens"
+    echo "size    : $BYTES bytes, $IM_TOKENS tokens ($SOURCE)"
     echo "at ctx $IM_CTX that is about $IM_CHUNKS chunks"
+    if [ -z "$IM_TOKENS_EXACT" ]; then
+        echo "build.py printed the real token count. Set it so the shards are even:"
+        echo "  IM_TOKENS_EXACT=<number> ; save_state"
+    fi
 }
 
 # im_plan N  ->  prints the exact command for each of N nodes. Paste one per box.
