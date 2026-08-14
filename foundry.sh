@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.21
+FOUNDRY_VERSION=2026-08-14.22
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -2139,29 +2139,63 @@ IMSTEOF
         | sed "s/^/  /" | tail -20
 }
 
+# Merge whatever shards are present, whatever they are called.
+#
+# IM_SKIP holds substrings of shard names to leave out. A shard that was killed
+# still left a partial file behind, because llama-imatrix writes snapshots as it
+# goes, and merging that alongside the ranges that replaced it counts those
+# chunks twice.
+#
+#   IM_SKIP="shard-5-of-6" im_merge_all
 im_merge_all() {
     need_preset || return 1
     repo_ok || return 1
-    mkdir -p /imatrix
-    hf download $METRICS --repo-type $METRICS_KIND --include "imatrix/shard-*" --local-dir /tmp/im
-    cp -n /tmp/im/imatrix/shard-*.gguf /imatrix/ 2>/dev/null
-
-    FILES=$(ls /imatrix/shard-*.gguf 2>/dev/null | sort)
-    if [ -z "$FILES" ]; then
-        echo "no shards found"
+    if [ ! -f "$IM_MODEL" ]; then
+        echo "IM_MODEL is not set. Run pick_model."
         return 1
     fi
-    echo "merging $(echo "$FILES" | wc -l) shards:"
-    echo "$FILES" | sed "s/^/  /"
+    mkdir -p /imatrix
+    hf download $METRICS --repo-type $METRICS_KIND --include "imatrix/shard-*" --local-dir /tmp/im > /dev/null
+    cp -n /tmp/im/imatrix/shard-*.gguf /imatrix/ 2>/dev/null
 
-    ARGS=""
-    for f in $FILES; do
-        ARGS="$ARGS --in-file $f"
+    local f keep="" skipped="" pat
+    for f in $(ls /imatrix/shard-*.gguf 2>/dev/null | sort); do
+        for pat in $IM_SKIP; do
+            case "$f" in *$pat*) skipped="$skipped $f"; continue 2 ;; esac
+        done
+        keep="$keep,$f"
     done
-    $BIN/llama-imatrix $ARGS -o /imatrix/imatrix.gguf 2>&1 | tee /logs/imatrix-merge.log
+    keep=${keep#,}
+
+    if [ -z "$keep" ]; then
+        echo "no shards to merge"
+        return 1
+    fi
+    echo "merging:"
+    echo "$keep" | tr ',' '\n' | sed "s/^/  /"
+    if [ -n "$skipped" ]; then
+        echo "skipped (IM_SKIP):"
+        for f in $skipped; do echo "  $f"; done
+    fi
+    echo
+
+    # This build wants one comma separated list, not a repeated flag, and it
+    # wants the model even for a pure merge.
+    stdbuf -oL -eL $BIN/llama-imatrix -m "$IM_MODEL" --in-file "$keep" \
+        -o /imatrix/imatrix.gguf 2>&1 | tee /logs/imatrix-merge.log
+
+    if [ ! -f /imatrix/imatrix.gguf ]; then
+        echo "merge produced nothing, read the log above"
+        autopush /logs/imatrix-merge.log logs/imatrix-merge.log
+        return 1
+    fi
     ls -lh /imatrix/imatrix.gguf
-    $BIN/llama-imatrix --in-file /imatrix/imatrix.gguf --show-statistics \
-        2>&1 | tee /logs/imatrix-stats.log | head -30
+
+    echo
+    echo "=== merged statistics ==="
+    stdbuf -oL -eL $BIN/llama-imatrix -m "$IM_MODEL" --in-file /imatrix/imatrix.gguf \
+        --show-statistics 2>&1 | tee /logs/imatrix-stats.log | head -30
+
     autopush /logs/imatrix-merge.log logs/imatrix-merge.log
     autopush /logs/imatrix-stats.log logs/imatrix-stats.log
     hf_put /imatrix/imatrix.gguf imatrix/imatrix.gguf "$METRICS" "$METRICS_KIND"
@@ -2187,19 +2221,17 @@ im_merge() {
         return 1
     fi
 
-    ARGS=""
-    for f in $(find /imatrix -name "shard-*-of-$N.gguf" | sort); do
-        ARGS="$ARGS --in-file $f"
-    done
-    echo "merging:$ARGS"
+    LIST=$(find /imatrix -name "shard-*-of-$N.gguf" | sort | paste -sd,)
+    echo "merging: $LIST"
 
-    $BIN/llama-imatrix $ARGS -o /imatrix/imatrix.gguf 2>&1 | tee /logs/imatrix-merge.log
+    stdbuf -oL -eL $BIN/llama-imatrix -m "$IM_MODEL" --in-file "$LIST" \
+        -o /imatrix/imatrix.gguf 2>&1 | tee /logs/imatrix-merge.log
     ls -lh /imatrix/imatrix.gguf
 
     echo
     echo "=== merged statistics ==="
-    $BIN/llama-imatrix --in-file /imatrix/imatrix.gguf --show-statistics \
-        2>&1 | tee /logs/imatrix-stats.log | head -30
+    stdbuf -oL -eL $BIN/llama-imatrix -m "$IM_MODEL" --in-file /imatrix/imatrix.gguf \
+        --show-statistics 2>&1 | tee /logs/imatrix-stats.log | head -30
     echo
     echo "Sanity check: the sum of squared activations here should equal the sum"
     echo "across the shards. Compare against im_stats on each shard."
@@ -2252,7 +2284,7 @@ im_stats() {
         echo "im_stats FILE.gguf"
         return 1
     fi
-    $BIN/llama-imatrix --in-file $1 --show-statistics 2>&1 | head -30
+    $BIN/llama-imatrix -m "$IM_MODEL" --in-file "$1" --show-statistics 2>&1 | head -30
 }
 
 
