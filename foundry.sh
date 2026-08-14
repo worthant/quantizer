@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.29
+FOUNDRY_VERSION=2026-08-14.30
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -2534,6 +2534,32 @@ check_types() {
     fi
 }
 
+# ladder_part I N
+# Take part I of N from the current /ladder.txt into /my.txt, always from the
+# file write_ladder just produced. Slicing by hand with sed leaves a stale copy
+# behind after every ladder change, and the stale copy is what then runs.
+ladder_part() {
+    if [ -z "$2" ]; then
+        echo "ladder_part I N       part I of N, 1 based"
+        echo "  ladder_part 2 4     second quarter of the ladder"
+        return 1
+    fi
+    if [ ! -f /ladder.txt ]; then
+        echo "no /ladder.txt. Run write_ladder."
+        return 1
+    fi
+    grep -v "^#" /ladder.txt | grep "|" > /tmp/rungs.txt
+    local total per from
+    total=$(wc -l < /tmp/rungs.txt)
+    per=$(( (total + $2 - 1) / $2 ))
+    from=$(( ($1 - 1) * per + 1 ))
+    sed -n "${from},$(( from + per - 1 ))p" /tmp/rungs.txt > /my.txt
+    echo "$total rungs total, part $1 of $2 is $(wc -l < /my.txt) of them:"
+    cut -d"|" -f1 /my.txt | sed "s/^/  /"
+    echo
+    echo "run:  ladder /my.txt --dry     then without --dry"
+}
+
 # ladder FILE
 # One rung per line:   LABEL | FALLBACK | rule rule rule
 # Blank lines and lines starting with # are ignored.
@@ -2608,9 +2634,12 @@ ladder() {
 
     if [ "$bad" -gt 0 ]; then
         echo
-        echo "$bad line(s) were not rungs. If the whole file looked wrong, it is"
-        echo "probably an error page from a failed download. Rewrite it with:"
-        echo "  write_ladder"
+        echo "$bad rung(s) were skipped."
+        echo "If they were rejected for their types, this file is older than the"
+        echo "ladder. Re-cut it from the current one:"
+        echo "  write_ladder ; ladder_part I N"
+        echo "If every line looked like json or html, the file is a failed"
+        echo "download rather than a ladder."
     fi
     results
 }
