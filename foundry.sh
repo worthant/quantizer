@@ -111,8 +111,19 @@ make_repos() {
     echo "  $MAIN            (model)"
     echo "  $METRICS   ($METRICS_KIND)"
     ask "create both?" || return 1
-    hf repos create $MAIN --repo-type model 2>&1 | tail -1
-    hf repos create $METRICS --repo-type $METRICS_KIND 2>&1 | tail -1
+    for pair in "$MAIN model" "$METRICS $METRICS_KIND"; do
+        set -- $pair
+        if python3 -c "
+import sys
+from huggingface_hub import HfApi
+sys.exit(0 if HfApi().repo_exists(sys.argv[1], repo_type=sys.argv[2]) else 1)
+" "$1" "$2" 2>/dev/null; then
+            echo "  already there: $1"
+        else
+            hf repos create $1 --repo-type $2 > /dev/null 2>&1 \
+                && echo "  created: $1" || echo "  FAILED: $1"
+        fi
+    done
     repo_ok && echo "metrics repo reachable"
 }
 
@@ -121,19 +132,46 @@ make_repos() {
 # which then fail to parse as JSON somewhere deep inside the build.
 get_tools() {
     token_check > /dev/null || return 1
-    which git-lfs > /dev/null 2>&1 || apt-get install -y -qq git-lfs
-    git lfs install > /dev/null 2>&1
+    apt-get install -y -qq git-lfs > /dev/null 2>&1
+    if git lfs version > /dev/null 2>&1; then
+        git lfs install > /dev/null 2>&1
+        HAVE_LFS=1
+    else
+        echo "git-lfs unavailable, large files will arrive as pointers and get"
+        echo "fetched from the hub instead"
+        HAVE_LFS=0
+    fi
 
     if [ -d /calib-corpora ]; then
         echo "already at /calib-corpora"
         cd /calib-corpora
         git pull --ff-only 2>&1 || echo "local changes present, keeping them and skipping the pull"
-        git lfs pull
+        [ "$HAVE_LFS" = "1" ] && git lfs pull
         cd - > /dev/null
     else
         git clone https://huggingface.co/datasets/AtomicChat/calib-corpora /calib-corpora || return 1
-        cd /calib-corpora && git lfs pull && cd - > /dev/null
+        [ "$HAVE_LFS" = "1" ] && (cd /calib-corpora && git lfs pull)
     fi
+    check_pool || true
+    echo
+    echo "if anything above is a pointer, run:  fix_pool"
+}
+
+# Pull the files that came down as pointers straight from the hub. Simpler and
+# more reliable than getting git-lfs working on a fresh container.
+fix_pool() {
+    POINTERS=$(grep -l "^version https://git-lfs" /calib-corpora/pool/*/*.jsonl \
+               /calib-corpora/pool/*/*/*.jsonl 2>/dev/null)
+    if [ -z "$POINTERS" ]; then
+        echo "no pointer files, nothing to fix"
+        return 0
+    fi
+    for f in $POINTERS; do
+        REL=${f#/calib-corpora/}
+        echo "fetching $REL"
+        hf download AtomicChat/calib-corpora --repo-type dataset \
+            --include "$REL" --local-dir /calib-corpora > /dev/null || return 1
+    done
     check_pool
 }
 
@@ -163,7 +201,7 @@ if pointers:
     for p in pointers[:10]:
         print("   ", p.replace("/calib-corpora/", ""))
     print()
-    print("fix:  cd /calib-corpora && git lfs pull")
+    print("fix:  fix_pool")
 if bad:
     print()
     print("%d files do not parse:" % len(bad))
@@ -1223,7 +1261,10 @@ build_corpus() {
     echo
     echo "what the sweep touched:"
     git -C /calib-corpora status --porcelain pool/vocab_sweep
-    TOUCHED=$(git -C /calib-corpora status --porcelain pool/vocab_sweep | awk '{print $2}')
+    # Only a modified shard under synthetic/ matters. sweep-stats.json is shared
+    # and is expected to change, and a brand new shard shows up as untracked.
+    TOUCHED=$(git -C /calib-corpora status --porcelain pool/vocab_sweep/synthetic \
+              | grep "^ M" | awk '{print $2}')
     for f in $TOUCHED; do
         case "$f" in
             *$NAME*) ;;
