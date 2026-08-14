@@ -24,6 +24,7 @@ use_nemotron() {
     MAIN=AtomicChat/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF
     METRICS=AtomicChat/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF-metrics
     METRICS_KIND=dataset
+    UPSTREAM=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
     show_preset
 }
 
@@ -31,15 +32,25 @@ use_qwen() {
     MAIN=AtomicChat/Qwen3.8-27B-GGUF
     METRICS=AtomicChat/Qwen3.8-27B-GGUF-metrics
     METRICS_KIND=dataset
+    UPSTREAM=Qwen/Qwen3.8-27B
     show_preset
 }
 
 show_preset() {
-    echo "main repo    : $MAIN"
-    echo "metrics repo : $METRICS  (type: $METRICS_KIND)"
-    echo "eval corpus  : $EVAL"
-    echo "context      : $CTX"
-    echo "bf16 file is found on disk by find_bf16, nothing is hardcoded"
+    echo "our gguf repo : $MAIN"
+    echo "metrics repo  : $METRICS  (type: $METRICS_KIND)"
+    echo "upstream      : $UPSTREAM   (original weights, only needed if we"
+    echo "                have not published a bf16 gguf yet)"
+    echo "eval corpus   : $EVAL"
+    echo "context       : $CTX"
+    echo
+    echo "Run plan to see what exists where and what to do next."
+}
+
+reload() {
+    curl -sL https://raw.githubusercontent.com/worthant/quantizer/main/foundry.sh -o /foundry.sh
+    source /foundry.sh
+    echo "reloaded from github"
 }
 
 need_preset() {
@@ -132,9 +143,13 @@ PRESET
   show_preset
 
 ORIENTATION
-  status                     what is done, what is next
+  plan                       what exists on disk AND in both repos, and what
+                             command to run next. Start here.
+  status                     local checklist only
+  ls_main / ls_metrics       list a remote repo with file sizes
   menu                       pick a command by number
   help_me                    this list
+  reload                     re-pull this script from github
 
 BOX SETUP
   check                      disk, GPUs, cores, RAM
@@ -151,6 +166,12 @@ DOWNLOAD, each one asks before pulling anything
   get_one "PATTERN"          one file by glob
   get_base                   pull an existing reference from the metrics repo
   find_bf16                  locate the bf16 file already on disk
+
+BUILD A BF16 THAT DOES NOT EXIST YET   (Qwen case, not Nemotron)
+  get_upstream               original safetensors from UPSTREAM into /src
+  setup_convert              torch and friends for the converter
+  make_bf16                  convert /src into a bf16 gguf
+  push_model_split FILE      publish it, split at 45 GB
 
 MEASURE
   base                       write the reference into /kld/base.kld
@@ -204,13 +225,19 @@ cuda_check() {
     nvidia-smi --query-gpu=name,driver_version --format=csv
     echo
     echo "=== forward compatibility libraries ==="
-    if ls -d /usr/local/cuda*/compat 2>/dev/null; then
-        echo
-        echo "These exist for hosts whose driver is OLDER than the image target."
-        echo "When the host driver is NEWER they break CUDA init with error 803."
-        echo "Compare the two versions above. If the driver is newer, run fix_cuda_compat."
+    COMPAT_LIB=$(ls /usr/local/cuda/compat/libcuda.so.*.* 2>/dev/null | head -1)
+    if [ -z "$COMPAT_LIB" ]; then
+        echo "none present, nothing to do"
     else
-        echo "none, nothing to worry about"
+        COMPAT_MAJOR=$(basename $COMPAT_LIB | sed "s/libcuda.so.//" | cut -d. -f1)
+        HOST_MAJOR=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1)
+        echo "compat libs target driver $COMPAT_MAJOR, host driver is $HOST_MAJOR"
+        if [ "$HOST_MAJOR" -ge "$COMPAT_MAJOR" ]; then
+            echo "Host driver is newer or equal, so these libs can only break CUDA init."
+            fix_cuda_compat
+        else
+            echo "Host driver is older, so these libs are needed. Leaving them alone."
+        fi
     fi
 
     {
@@ -226,6 +253,14 @@ fix_cuda_compat() {
     rm -rf /usr/local/cuda*/compat
     ldconfig
     echo "Compat libraries removed. The host driver now wins."
+}
+
+setup_convert() {
+    echo "This installs torch and friends so convert_hf_to_gguf.py can run."
+    echo "Around 3 GB of downloads. Only needed when we have to BUILD a bf16 gguf."
+    ask "install?" || return 1
+    pip install --break-system-packages -q -U -r /llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+    echo "done"
 }
 
 setup() {
@@ -269,6 +304,149 @@ gpu_test() {
     echo
     echo "Every GPU should be listed above. If the list is empty or short,"
     echo "run fix_cuda_compat and try again."
+}
+
+
+# ================================================================== what exists where
+
+ls_main() {
+    need_preset || return 1
+    list_repo "$MAIN" model
+}
+
+ls_metrics() {
+    need_preset || return 1
+    list_repo "$METRICS" "$METRICS_KIND"
+}
+
+list_repo() {
+    python3 - "$1" "$2" << 'LSEOF'
+import sys
+from huggingface_hub import HfApi
+repo, kind = sys.argv[1], sys.argv[2]
+try:
+    tree = list(HfApi().list_repo_tree(repo, repo_type=kind, recursive=True))
+except Exception as e:
+    print("cannot read %s (%s): %s" % (repo, kind, e))
+    sys.exit(1)
+total = 0
+for f in sorted(tree, key=lambda x: x.path):
+    size = getattr(f, "size", None)
+    if size is None:
+        continue
+    total += size
+    print("%10.2f GB  %s" % (size / 1e9, f.path))
+print("---")
+print("%10.2f GB  total, %d files" % (total / 1e9, len([f for f in tree if getattr(f, "size", None)])))
+LSEOF
+}
+
+plan() {
+    need_preset || return 1
+    python3 - "$MAIN" "$METRICS" "$METRICS_KIND" "$UPSTREAM" << 'PLANEOF'
+import os, sys, glob
+from huggingface_hub import HfApi
+
+main, metrics, kind, upstream = sys.argv[1:5]
+api = HfApi()
+
+def files(repo, t):
+    try:
+        return api.list_repo_files(repo, repo_type=t)
+    except Exception:
+        return None
+
+main_files = files(main, "model")
+metric_files = files(metrics, kind)
+
+def block(title, on_disk, remote_line, todo):
+    print()
+    print(title)
+    print("  on disk         : %s" % on_disk)
+    print("  remote          : %s" % remote_line)
+    print("  -> %s" % todo)
+
+# --- bf16
+local_bf16 = [p for p in glob.glob("/gguf/**/*.gguf", recursive=True) if "bf16" in p.lower()]
+if main_files is None:
+    remote_bf16 = []
+else:
+    remote_bf16 = [f for f in main_files if "bf16" in f.lower() and f.endswith(".gguf")]
+
+if local_bf16:
+    todo = "nothing, it is here"
+elif remote_bf16:
+    todo = "run: get_bf16"
+else:
+    todo = "not published yet. run: get_upstream, then setup_convert, then make_bf16"
+block("BF16 reference weights",
+      ("%d files" % len(local_bf16)) if local_bf16 else "no",
+      ("%d files in %s" % (len(remote_bf16), main)) if remote_bf16
+        else ("repo unreadable" if main_files is None else "not in %s" % main),
+      todo)
+
+# --- kld base
+local_base = os.path.exists("/kld/base.kld")
+remote_base = [f for f in (metric_files or []) if f.endswith(".kld")]
+if local_base:
+    todo = "nothing, it is here"
+elif remote_base:
+    todo = "run: get_base"
+elif local_bf16:
+    todo = "run: base      (this computes it, 4 to 8 minutes)"
+else:
+    todo = "get the bf16 first, then run: base"
+block("KLD reference (.kld)",
+      "yes, %.2f GB" % (os.path.getsize("/kld/base.kld") / 1e9) if local_base else "no",
+      ("%d in %s" % (len(remote_base), metrics)) if remote_base
+        else ("metrics repo unreadable, check METRICS_KIND" if metric_files is None
+              else "not in %s" % metrics),
+      todo)
+
+# --- quants
+local_q = [p for p in glob.glob("/gguf/*.gguf") if "bf16" not in p.lower()]
+remote_q = [f for f in (main_files or [])
+            if f.endswith(".gguf") and "bf16" not in f.lower()
+            and "imatrix" not in f and not f.startswith(("dflash-", "dspark-"))]
+block("Quants to measure",
+      "%d files" % len(local_q),
+      "%d files in %s" % (len(remote_q), main) if main_files is not None else "repo unreadable",
+      "nothing, they are here" if len(local_q) >= len(remote_q) and local_q else "run: get_quants")
+print()
+PLANEOF
+}
+
+get_upstream() {
+    need_preset || return 1
+    echo "This pulls the ORIGINAL weights from $UPSTREAM into /src."
+    echo "Only needed when we have not published a bf16 gguf ourselves."
+    ask "download?" || return 1
+    mkdir -p /src
+    hf download $UPSTREAM --local-dir /src
+    du -sh /src
+    ls /src
+}
+
+make_bf16() {
+    need_preset || return 1
+    if [ ! -d /src ]; then
+        echo "no original weights in /src. Run get_upstream."
+        return 1
+    fi
+    if [ ! -f /llama.cpp/convert_hf_to_gguf.py ]; then
+        echo "llama.cpp not cloned. Run build first."
+        return 1
+    fi
+    OUT=/gguf/$(basename $MAIN | sed "s/-GGUF//")-bf16.gguf
+    echo "converting /src -> $OUT"
+    echo "If it fails with NaN in token_embd, add --no-lazy and rerun."
+    date
+    python3 /llama.cpp/convert_hf_to_gguf.py /src --outtype bf16 --outfile $OUT \
+        2>&1 | tee /logs/convert.log
+    date
+    ls -lh $OUT
+    echo
+    echo "Publish it with push_model_split so it clears the 50 GB per-file limit."
 }
 
 
