@@ -102,14 +102,27 @@ get_tools() {
     ls /calib-corpora/tools /calib-corpora/recipes
 }
 
+# The single definition of "a file we measure". Everything else in /gguf is a
+# reference, a drafter, or the imatrix, and none of those are quants.
+quant_files() {
+    find /gguf -maxdepth 2 -name "*.gguf" 2>/dev/null \
+        | grep -v -i "bf16" \
+        | grep -v "/dflash-" \
+        | grep -v "/dspark-" \
+        | grep -v -i "imatrix" \
+        | sort
+}
+
 autopush() {
     if [ "$AUTOPUSH" != "1" ] || [ -z "$METRICS" ] || [ ! -f "$1" ]; then
         return 0
     fi
-    if hf upload $METRICS --repo-type $METRICS_KIND "$1" "$2" > /dev/null 2>&1; then
+    OUT=$(hf upload $METRICS --repo-type $METRICS_KIND "$1" "$2" 2>&1)
+    if [ $? -eq 0 ]; then
         echo "  uploaded -> $METRICS :: $2"
     else
-        echo "  UPLOAD FAILED for $2, run push_logs later"
+        echo "  UPLOAD FAILED for $2:"
+        echo "$OUT" | sed "s/^/    /"
     fi
 }
 
@@ -362,6 +375,7 @@ DOWNLOAD, each one asks before pulling anything
   get_one "PATTERN"          one file by glob
   get_base                   pull an existing reference from the metrics repo
   find_bf16                  locate the bf16 file already on disk
+  quant_files                list exactly what will be measured, nothing else
 
 BUILD A BF16 THAT DOES NOT EXIST YET   (Qwen case, not Nemotron)
   get_upstream               original safetensors from UPSTREAM into /src
@@ -394,7 +408,9 @@ UPLOAD, one job each
   make_metrics               create the metrics repo if it does not exist
   repo_ok                    check the metrics repo is reachable
   get_tools                  clone calib-corpora with recipes and pipeline
-  push_base                  reference logits, hash, README, logs -> metrics
+  push_base                  reference logits, manifest, README, logs -> metrics
+  HASH_BLOB=1                also sha256 the blob, off by default: it reads the
+                             whole file and the hub already verifies transport
                              splits into 45 GB parts when over the limit
   send_base user@host PORT   ship the reference straight to another box
   use_gpus 0,1               how many GPUs the quant runs may use
@@ -813,9 +829,10 @@ set_ctx() {
 }
 
 find_bf16() {
-    FOUND=$(find /gguf -name "*.gguf" 2>/dev/null | grep -i bf16 | grep "00001-of-" | head -1)
+    ALL=$(find /gguf -name "*.gguf" 2>/dev/null | grep -i bf16 | grep -v "/dflash-" | grep -v "/dspark-")
+    FOUND=$(echo "$ALL" | grep "00001-of-" | head -1)
     if [ -z "$FOUND" ]; then
-        FOUND=$(find /gguf -name "*.gguf" 2>/dev/null | grep -i bf16 | head -1)
+        FOUND=$(echo "$ALL" | head -1)
     fi
     if [ -z "$FOUND" ]; then
         echo "no bf16 in /gguf. Run get_bf16."
@@ -835,7 +852,8 @@ get_bf16() {
     fi
     echo "This pulls the bf16 reference from $MAIN. Around 66 GB for Nemotron."
     ask "download?" || return 1
-    hf download $MAIN --include "*bf16*" --include "*BF16*" --local-dir /gguf
+    hf download $MAIN --include "*bf16*" --include "*BF16*" \
+        --exclude "dflash-*" --exclude "dspark-*" --local-dir /gguf
     find_bf16
 }
 
@@ -1070,9 +1088,16 @@ kld() {
 }
 
 kld_all() {
-    TOTAL=$(ls /gguf/*.gguf 2>/dev/null | wc -l)
+    FILES=$(quant_files)
+    if [ -z "$FILES" ]; then
+        echo "no quants in /gguf. Run get_quants."
+        echo "what is there now:"
+        find /gguf -name "*.gguf" | sed "s/^/   /"
+        return 1
+    fi
+    TOTAL=$(echo "$FILES" | wc -l)
     N=0
-    for f in /gguf/*.gguf; do
+    for f in $FILES; do
         N=$(( N + 1 ))
         echo
         echo "########## $N of $TOTAL, roughly $(( (TOTAL - N) * 3 )) minutes left ##########"
@@ -1091,7 +1116,12 @@ bench() {
 }
 
 bench_all() {
-    for f in /gguf/*.gguf; do
+    FILES=$(quant_files)
+    if [ -z "$FILES" ]; then
+        echo "no quants in /gguf. Run get_quants."
+        return 1
+    fi
+    for f in $FILES; do
         bench $f
     done
     results
@@ -1315,7 +1345,10 @@ for key, row in out.items():
             row['size_bytes'] = os.path.getsize(p)
             row['size_gb'] = round(os.path.getsize(p) / 1e9, 2)
 
-rows = sorted(out.values(), key=lambda r: (r.get('eval_set') or '', r.get('size_gb') or 0))
+failed = [r for r in out.values()
+          if r.get('eval_set') != 'speed' and r.get('mean_kld') is None]
+rows = [r for r in out.values() if r not in failed]
+rows = sorted(rows, key=lambda r: (r.get('eval_set') or '', r.get('size_gb') or 0))
 with open('/logs/results.json', 'w') as f:
     json.dump(rows, f, indent=2)
 
@@ -1325,6 +1358,12 @@ for r in rows:
         r.get('eval_set', ''), r['name'][:44],
         r.get('size_gb', ''), r.get('mean_kld', ''),
         r.get('top1_pct', ''), r.get('tg128_tps', '')))
+if failed:
+    print()
+    print('%d run(s) produced no KLD, left out of results.json:' % len(failed))
+    for r in failed:
+        print('   ', r['name'])
+    print('check the matching log in /logs')
 print()
 print('written to /logs/results.json')
 PYEOF
@@ -1357,9 +1396,22 @@ push_base() {
     SIZE=$(stat -c %s $BASE)
     echo
     echo "reference blob: $(( SIZE / 1000000000 )) GB"
-    echo "hashing, this takes a minute on a file this size"
-    sha256sum $BASE | sed "s|/kld/||" > /kld/base-$EVALSET.kld.sha256
-    cat /kld/base-$EVALSET.kld.sha256
+
+    # A manifest, not a hash. The hub already verifies transport, and the file
+    # is not bit reproducible across different GPU counts and drivers, so a
+    # published checksum would mislead rather than help. The one thing worth
+    # checking on the far side is that reassembly produced a whole file, and
+    # the byte count does that instantly.
+    echo "size_bytes $SIZE" > /kld/base-$EVALSET.manifest.txt
+    echo "context $CTX" >> /kld/base-$EVALSET.manifest.txt
+    echo "eval_set $EVALSET" >> /kld/base-$EVALSET.manifest.txt
+    cat /kld/base-$EVALSET.manifest.txt
+
+    if [ "$HASH_BLOB" = "1" ]; then
+        echo "HASH_BLOB=1, hashing. Reads the whole file, takes a while."
+        sha256sum $BASE | sed "s|/kld/||" > /kld/base-$EVALSET.kld.sha256
+        cat /kld/base-$EVALSET.kld.sha256
+    fi
 
     write_kld_readme
 
@@ -1370,7 +1422,8 @@ push_base() {
         mkdir -p /kld/parts
         split -b 45G -d --additional-suffix=.part $BASE /kld/parts/base-$EVALSET.kld.
         ls -lh /kld/parts
-        cp /kld/base-$EVALSET.kld.sha256 /kld/parts/
+        cp /kld/base-$EVALSET.manifest.txt /kld/parts/
+        [ -f /kld/base-$EVALSET.kld.sha256 ] && cp /kld/base-$EVALSET.kld.sha256 /kld/parts/
         cp /kld/README.md /kld/parts/
         echo
         ask "upload the parts now?" || return 0
@@ -1378,7 +1431,7 @@ push_base() {
     else
         ask "upload the blob now?" || return 0
         hf upload $METRICS --repo-type $METRICS_KIND $BASE kld/base-$EVALSET.kld
-        hf upload $METRICS --repo-type $METRICS_KIND /kld/base-$EVALSET.kld.sha256 kld/base-$EVALSET.kld.sha256
+        hf upload $METRICS --repo-type $METRICS_KIND /kld/base-$EVALSET.manifest.txt kld/base-$EVALSET.manifest.txt
         hf upload $METRICS --repo-type $METRICS_KIND /kld/README.md kld/README.md
     fi
     echo "done"
@@ -1430,10 +1483,17 @@ get_base() {
     elif ls /kld/kld/base-$EVALSET.kld.*.part > /dev/null 2>&1; then
         echo "reassembling parts"
         cat /kld/kld/base-$EVALSET.kld.*.part > $BASE
-        if [ -f /kld/kld/base-$EVALSET.kld.sha256 ]; then
-            cd /kld && sha256sum -c base-$EVALSET.kld.sha256 ; cd -
-        fi
         rm -f /kld/kld/base-$EVALSET.kld.*.part
+        if [ -f /kld/kld/base-$EVALSET.manifest.txt ]; then
+            WANT=$(grep size_bytes /kld/kld/base-$EVALSET.manifest.txt | cut -d" " -f2)
+            GOT=$(stat -c %s $BASE)
+            if [ "$WANT" = "$GOT" ]; then
+                echo "size matches the manifest: $GOT bytes"
+            else
+                echo "SIZE MISMATCH: expected $WANT, got $GOT. A part is missing or truncated."
+                return 1
+            fi
+        fi
     fi
     ls -lh $BASE
 }
