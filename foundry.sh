@@ -141,6 +141,9 @@ BASE=$BASE
 CTX=$CTX
 GPUS=$GPUS
 AUTOPUSH=$AUTOPUSH
+IM_MODEL=$IM_MODEL
+IM_CORPUS=$IM_CORPUS
+IM_CTX=$IM_CTX
 STATEEOF
 }
 
@@ -267,6 +270,28 @@ status() {
     mark "results.json"       /logs/results.json         "results"
 
     echo
+    echo "  imatrix:"
+    if [ -f /eval/calib_train.txt ]; then
+        echo "    [x] calibration corpus"
+    else
+        echo "    [ ] calibration corpus  ->  run:  get_calib <recipe-name>"
+        echo "                                for a model we never did:  new_model NAME REPO"
+    fi
+    if [ -n "$IM_MODEL" ] && [ -f "$IM_MODEL" ]; then
+        echo "    [x] IM_MODEL: $(basename $IM_MODEL)"
+    else
+        echo "    [ ] IM_MODEL not set    ->  run:  pick_model"
+    fi
+    SHARDS=$(ls /imatrix/shard-*.gguf 2>/dev/null | wc -l)
+    if [ -f /imatrix/imatrix.gguf ]; then
+        echo "    [x] imatrix merged"
+    elif [ "$SHARDS" -gt 0 ]; then
+        echo "    [~] $SHARDS shard(s) here  ->  run:  im_merge N   once every node is done"
+    else
+        echo "    [ ] no imatrix          ->  run:  im_plan N, then im_shard I N on each box"
+    fi
+
+    echo
     echo "  uploaded to $METRICS:"
     if [ -z "$METRICS" ]; then
         echo "    no preset loaded"
@@ -317,6 +342,7 @@ number: "
         "cuda_check" "gpu_test" "setup" "build 120" \
         "get_bf16" "get_quants" "find_bf16" "eval_size" \
         "base" "kld_all" "bench_all" "results" \
+        "pick_model" "im_size" "im_plan 4" "im_merge 4" \
         "push_base" "push_logs" "push_results" \
         "ls_main" "ls_metrics" "ls_corpora" \
         "quit"
@@ -354,6 +380,10 @@ BOX SETUP
   setup                      apt + hugging face cli
   build 120                  compile. 120 blackwell, 90 hopper, 89 ada, 86 ampere
   gpu_test                   does ggml actually see the GPUs
+
+A MODEL WE HAVE NEVER QUANTIZED BEFORE
+  new_model NAME REPO        template check plus a fully filled in recipe
+  make_recipe NAME REPO      just the recipe, every field read from the hub
 
 CALIBRATION CORPUS
   ls_corpora                 what is in AtomicChat/calib-corpora
@@ -395,6 +425,7 @@ IMATRIX, split across as many boxes as you like
   get_calib NAME             the calibration corpus for a recipe build
   IM_MODEL=/gguf/x.gguf      the model the imatrix is collected on
   im_size                    tokens and total chunk count
+  pick_model                 choose IM_MODEL from a numbered list, bf16 first
   im_plan N                  prints the command for each of N nodes
   im_shard I N               node I of N. Uploads its shard when done
   im_merge N                 pulls every shard, merges, uploads the result
@@ -1144,6 +1175,255 @@ gen() {
 
     echo
     grep -E "eval time|tokens per second|accept" /logs/gen-$NAME-$TAG.log
+}
+
+
+# ================================================================== new model scaffold
+
+# make_recipe NAME UPSTREAM_REPO
+# Reads config.json, tokenizer_config.json and the chat template straight off
+# the hub and writes a complete recipe. Nothing is left for you to fill in by
+# hand except the domain shares, which are a judgement call about the model's
+# use, not a fact you can read out of a config file.
+make_recipe() {
+    if [ -z "$2" ]; then
+        echo "make_recipe NAME UPSTREAM_REPO"
+        echo "  make_recipe qwen3.8-27b Qwen/Qwen3.8-27B"
+        return 1
+    fi
+    pip install --break-system-packages -q -U jinja2 pyyaml > /dev/null 2>&1
+    mkdir -p /recipes
+    python3 - "$1" "$2" << 'RECIPEEOF'
+import json, os, re, sys
+from huggingface_hub import hf_hub_download
+
+name, repo = sys.argv[1], sys.argv[2]
+
+def grab(fn):
+    try:
+        return open(hf_hub_download(repo, fn), encoding="utf-8").read()
+    except Exception:
+        return None
+
+cfg_raw = grab("config.json")
+if cfg_raw is None:
+    print("cannot read config.json from %s" % repo)
+    sys.exit(1)
+cfg = json.loads(cfg_raw)
+tok_cfg = json.loads(grab("tokenizer_config.json") or "{}")
+
+# some repos nest the real config under text_config
+inner = cfg.get("text_config") or cfg
+
+def pick(*keys, default=None):
+    for k in keys:
+        for src_ in (inner, cfg):
+            if src_.get(k) is not None:
+                return src_[k]
+    return default
+
+vocab   = pick("vocab_size", default=0)
+layers  = pick("num_hidden_layers", "n_layer", default=0)
+ctxlen  = pick("max_position_embeddings", default=0)
+window  = pick("sliding_window", default=None)
+hidden  = pick("hidden_size", default=0)
+inter   = pick("intermediate_size", default=0)
+moe     = pick("moe_intermediate_size", default=None)
+experts = pick("num_experts", "n_routed_experts", "num_local_experts", default=None)
+
+print("read from %s:" % repo)
+for k, v in (("vocab_size", vocab), ("layers", layers), ("context", ctxlen),
+             ("sliding_window", window), ("hidden_size", hidden),
+             ("intermediate_size", inter), ("moe_intermediate_size", moe),
+             ("experts", experts)):
+    print("  %-22s %s" % (k, v))
+
+print()
+print("superblock check, rows must divide by 256 or every k/i quant below")
+print("4.5 bpw silently falls back to a block-32 type:")
+shape_lines = []
+for k, v in (("hidden_size", hidden), ("intermediate_size", inter),
+             ("moe_intermediate_size", moe)):
+    if not v:
+        continue
+    rem = v % 256
+    verdict = "ok" if rem == 0 else "BREAKS k/i quants"
+    print("  %-22s %6d   %%256 = %3d   %s" % (k, v, rem, verdict))
+    shape_lines.append("%s = %d (%%256 = %d)" % (k, v, rem))
+
+# chat template
+template = grab("chat_template.jinja")
+where = "chat_template.jinja"
+if template is None:
+    template = tok_cfg.get("chat_template")
+    where = "tokenizer_config.json"
+if isinstance(template, list):
+    template = template[0].get("template")
+
+add_bos = bool(tok_cfg.get("add_bos_token", False))
+uses_date = bool(template and "strftime_now" in template)
+thinking = bool(template and re.search(r"enable_thinking|<think>", template))
+
+print()
+if template:
+    print("chat template found in %s, %d chars" % (where, len(template)))
+else:
+    print("NO CHAT TEMPLATE. The corpus cannot be rendered the way the model")
+    print("actually reads text. Run corpus_check and decide before building.")
+print("  add_bos_token       : %s" % add_bos)
+print("  calls strftime_now  : %s%s" % (uses_date, "  <- pinned below" if uses_date else ""))
+print("  mentions thinking   : %s" % thinking)
+
+known_renders = ["dsv4", "nemotron", "muse-glimmer"]
+excl = [r for r in known_renders if r not in name]
+
+reasoning_share = 15 if thinking else 10
+code_share = 18 if thinking else 23
+longctx_share = 12 if window is None else 10
+
+body = """# Calibration recipe for {repo}.
+# Generated by foundry make_recipe. Everything under model: was read from the
+# hub, not typed. The shares below are the one human judgement call: they say
+# what this model is for, which no config file knows.
+#
+# Architecture facts that matter here:
+{shapes}
+#
+# Shares:
+#   agentic 25      tool markup is a dense token set natural text never emits,
+#                   so without real weight the imatrix has no statistics for it
+#   code {code}         the agentic evals in this class are code shaped
+#   reasoning {reason}    {reason_why}
+#   multilingual 14 non-Latin embedding rows are only exercised by real
+#                   multilingual text
+#   longctx {lctx}      {lctx_why}
+#   vocab_sweep 10  regenerated against THIS tokenizer, {vocab} rows. A sweep
+#                   built for another model is meaningless here
+#   structured 5    JSON, YAML, TOML, SQL, as files and inside assistant turns
+#   graphics 3      kept small for continuity with the other builds
+
+name: {name}
+
+model:
+  repo: {repo}
+  tokenizer: /src/tokenizer.json
+  gguf: /gguf/{name}-bf16.gguf
+  vocab_size: {vocab}
+  layers: {layers}
+  sliding_window: {window}
+  context_length: {ctxlen}
+  llama_cpp_commit: FILLED_AT_BUILD_TIME
+
+seed: 20260814
+
+chat:
+  format: {name}
+  add_bos_per_document: {add_bos}
+{date_pin}
+calib_train:
+  target_tokens: 5000000
+  max_doc_fraction:
+    default: 0.05
+    longctx: 0.12
+  shares:
+    agentic: 25
+    code: {code}
+    reasoning: {reason}
+    multilingual: 14
+    longctx: {lctx}
+    vocab_sweep: 10
+    structured: 5
+    graphics: 3
+
+calib_longctx:
+  target_tokens: 750000
+  doc_tokens_min: 16384
+  doc_tokens_max: 32768
+  sources: [longctx]
+
+exclude:
+  # Anything pre-rendered with another model's markup. Those byte sequences are
+  # not special tokens for this tokenizer, so they would calibrate on text this
+  # model never sees.
+  render: [{excl}]
+  provenance_key: excluded_from_builds
+
+notes:
+  imatrix: >
+    llama-imatrix defaults to parse_special = false. Without --parse-special the
+    chat markup in calib_train.txt is tokenised as literal punctuation and the
+    agentic and reasoning slices calibrate on text the model never sees.
+""".format(
+    repo=repo, name=name, vocab=vocab, layers=layers, ctxlen=ctxlen,
+    window="null" if window is None else window,
+    add_bos="true" if add_bos else "false",
+    code=code_share, reason=reasoning_share, lctx=longctx_share,
+    reason_why=("the thinking channel is on the default inference path here"
+                if thinking else "no thinking channel found in the template"),
+    lctx_why=("no sliding window, so long range behaviour is only exercised by "
+              "long documents" if window is None else
+              "sliding window present, short documents already exercise it"),
+    shapes="\n".join("#   " + s for s in shape_lines) or "#   (no shape info)",
+    excl=", ".join(excl),
+    date_pin=('  # the template calls strftime_now, so the date is pinned or two\n'
+              '  # builds on different days would differ\n'
+              '  pin_date: "2026-08-14"\n' if uses_date else ""),
+)
+
+out = "/recipes/%s.yaml" % name
+open(out, "w").write(body)
+print()
+print("wrote %s" % out)
+print("read it once, adjust the shares if this model is not what the comments assume")
+RECIPEEOF
+}
+
+# One command for a brand new model: validate the template, then write a recipe
+# with every architecture field already filled in.
+new_model() {
+    if [ -z "$2" ]; then
+        echo "new_model NAME UPSTREAM_REPO"
+        echo "  new_model qwen3.8-27b Qwen/Qwen3.8-27B"
+        return 1
+    fi
+    echo "=============== 1. chat template and special tokens ==============="
+    corpus_check $2
+    echo
+    echo "=============== 2. recipe ==============="
+    make_recipe $1 $2
+    echo
+    echo "=============== 3. next ==============="
+    echo "  cat /recipes/$1.yaml"
+    echo "  get_tools                     # clone calib-corpora"
+    echo "  cp /recipes/$1.yaml /calib-corpora/recipes/"
+    echo "  then build the corpus with the pipeline in /calib-corpora/tools"
+}
+
+# Interactive picker for the model the imatrix is collected on. bf16 first:
+# q8 is a memory compromise, not a better choice.
+pick_model() {
+    FILES=$(find /gguf -maxdepth 2 -name "*.gguf" 2>/dev/null \
+            | grep -v "/dflash-" | grep -v "/dspark-" | grep -v -i "imatrix" \
+            | grep -v -- "-0000[2-9]-of-" | sort)
+    if [ -z "$FILES" ]; then
+        echo "nothing in /gguf yet"
+        return 1
+    fi
+    echo
+    echo "bf16 is the right choice when it fits. q8 is a compromise for memory."
+    echo
+    PS3="
+number: "
+    select f in $FILES "cancel"; do
+        if [ "$f" = "cancel" ] || [ -z "$f" ]; then
+            break
+        fi
+        IM_MODEL=$f
+        save_state
+        echo "IM_MODEL = $IM_MODEL"
+        ls -lh $IM_MODEL
+        break
+    done
 }
 
 
