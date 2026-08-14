@@ -90,450 +90,61 @@ make_metrics() {
     repo_ok && echo "reachable now"
 }
 
-# Clone the calibration dataset with its pipeline, so corpora can be built here.
+# Clone the calibration dataset with its pipeline. Large pool files live in
+# LFS, and a clone without git-lfs brings down pointer stubs instead of data,
+# which then fail to parse as JSON somewhere deep inside the build.
 get_tools() {
+    token_check > /dev/null || return 1
+    which git-lfs > /dev/null 2>&1 || apt-get install -y -qq git-lfs
+    git lfs install > /dev/null 2>&1
+
     if [ -d /calib-corpora ]; then
         echo "already at /calib-corpora"
-        cd /calib-corpora && git pull && cd -
-        return 0
-    fi
-    token_check || return 1
-    git clone https://huggingface.co/datasets/AtomicChat/calib-corpora /calib-corpora
-    ls /calib-corpora/tools /calib-corpora/recipes
-}
-
-# The single definition of "a file we measure". Everything else in /gguf is a
-# reference, a drafter, or the imatrix, and none of those are quants.
-# Files we publish and stand behind. Anything under experimental/ is off by
-# default: set INCLUDE_EXPERIMENTAL=1 to measure those too, which you want when
-# the published card quotes numbers for them.
-INCLUDE_EXPERIMENTAL=0
-
-quant_files() {
-    if [ "$INCLUDE_EXPERIMENTAL" = "1" ]; then
-        DEPTH=2
+        cd /calib-corpora && git pull && git lfs pull && cd - > /dev/null
     else
-        DEPTH=1
+        git clone https://huggingface.co/datasets/AtomicChat/calib-corpora /calib-corpora || return 1
+        cd /calib-corpora && git lfs pull && cd - > /dev/null
     fi
-    find /gguf -maxdepth $DEPTH -name "*.gguf" 2>/dev/null \
-        | grep -v -i "bf16" \
-        | grep -v "/dflash-" \
-        | grep -v "/dspark-" \
-        | grep -v -i "imatrix" \
-        | sort
+    check_pool
 }
 
-autopush() {
-    if [ "$AUTOPUSH" != "1" ] || [ -z "$METRICS" ] || [ ! -f "$1" ]; then
-        return 0
-    fi
-    OUT=$(hf upload $METRICS --repo-type $METRICS_KIND "$1" "$2" 2>&1)
-    if [ $? -eq 0 ]; then
-        echo "  uploaded -> $METRICS :: $2"
-    else
-        echo "  UPLOAD FAILED for $2:"
-        echo "$OUT" | sed "s/^/    /"
-    fi
+# Every jsonl in the pool has to parse, and an LFS pointer does not. Find the
+# bad file by name instead of watching build.py die on an anonymous line.
+check_pool() {
+    python3 - << 'POOLEOF'
+import glob, json, os
+
+bad, pointers, ok = [], [], 0
+for path in sorted(glob.glob("/calib-corpora/pool/**/*.jsonl", recursive=True)):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            first = f.readline()
+            if first.startswith("version https://git-lfs"):
+                pointers.append(path)
+                continue
+            json.loads(first)
+        ok += 1
+    except Exception as e:
+        bad.append((path, str(e)[:60]))
+
+print("%d pool files parse" % ok)
+if pointers:
+    print()
+    print("%d files are LFS pointers, not data:" % len(pointers))
+    for p in pointers[:10]:
+        print("   ", p.replace("/calib-corpora/", ""))
+    print()
+    print("fix:  cd /calib-corpora && git lfs pull")
+if bad:
+    print()
+    print("%d files do not parse:" % len(bad))
+    for p, e in bad[:10]:
+        print("    %s   %s" % (p.replace("/calib-corpora/", ""), e))
+if not pointers and not bad:
+    print("pool is clean")
+POOLEOF
 }
 
-# Bash functions live inside one shell process, so a new tmux pane is a new
-# shell that knows nothing. save_state writes the current preset to /state.sh
-# and the bottom of this file reads it back, so every pane agrees.
-save_state() {
-    cat > $STATE << STATEEOF
-MAIN=$MAIN
-METRICS=$METRICS
-METRICS_KIND=$METRICS_KIND
-UPSTREAM=$UPSTREAM
-EVALSET=$EVALSET
-EVAL=$EVAL
-BASE=$BASE
-CTX=$CTX
-GPUS=$GPUS
-AUTOPUSH=$AUTOPUSH
-INCLUDE_EXPERIMENTAL=$INCLUDE_EXPERIMENTAL
-IM_MODEL=$IM_MODEL
-IM_CORPUS=$IM_CORPUS
-IM_CTX=$IM_CTX
-STATEEOF
-}
-
-persist_shell() {
-    grep -q "source /foundry.sh" ~/.bashrc 2>/dev/null || echo "source /foundry.sh" >> ~/.bashrc
-    echo "Added to ~/.bashrc. Every new tmux pane now loads this by itself."
-}
-
-# Which held-out set we measure on. Everything downstream is named after it,
-# so several sets can live side by side without overwriting each other.
-EVALSET=neutral
-EVAL=/eval/neutral.txt
-BASE=/kld/base-neutral.kld
-
-use_evalset() {
-    if [ -z "$1" ]; then
-        echo "use_evalset neutral | agentic | code       current: $EVALSET"
-        return 1
-    fi
-    EVALSET=$1
-    EVAL=/eval/$1.txt
-    BASE=/kld/base-$1.kld
-    save_state
-    echo "eval set  : $EVALSET"
-    echo "corpus    : $EVAL"
-    echo "reference : $BASE"
-}
-
-
-# ================================================================== presets
-
-use_nemotron() {
-    MAIN=AtomicChat/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF
-    METRICS=AtomicChat/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF-metrics
-    METRICS_KIND=dataset
-    UPSTREAM=nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
-    save_state
-    show_preset
-}
-
-use_qwen() {
-    MAIN=AtomicChat/Qwen3.8-27B-GGUF
-    METRICS=AtomicChat/Qwen3.8-27B-GGUF-metrics
-    METRICS_KIND=dataset
-    UPSTREAM=Qwen/Qwen3.8-27B
-    save_state
-    show_preset
-}
-
-show_preset() {
-    echo "our gguf repo : $MAIN"
-    echo "metrics repo  : $METRICS  (type: $METRICS_KIND)"
-    echo "upstream      : $UPSTREAM   (original weights, only needed if we"
-    echo "                have not published a bf16 gguf yet)"
-    echo "eval corpus   : $EVAL"
-    echo "context       : $CTX"
-    echo
-    echo "Run plan to see what exists where and what to do next."
-}
-
-reload() {
-    curl -sL https://raw.githubusercontent.com/worthant/quantizer/main/foundry.sh -o /foundry.sh
-    source /foundry.sh
-    echo "reloaded from github"
-}
-
-need_preset() {
-    if [ -z "$MAIN" ]; then
-        echo "No preset loaded. Run use_nemotron or use_qwen first."
-        return 1
-    fi
-}
-
-ask() {
-    read -p "$1 [y/N] " answer
-    if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
-        return 0
-    fi
-    echo "skipped"
-    return 1
-}
-
-
-# ================================================================== status
-
-mark() {
-    if [ -e "$2" ]; then
-        echo "  [x] $1"
-    else
-        echo "  [ ] $1        ->  run:  $3"
-    fi
-}
-
-status() {
-    echo
-    if [ -z "$MAIN" ]; then
-        echo "  [ ] preset loaded      ->  run:  use_nemotron"
-    else
-        echo "  [x] preset: $MAIN"
-    fi
-    mark "cuda checked"       /logs/env.txt              "cuda_check"
-    mark "tools installed"    /usr/bin/ninja             "setup"
-    mark "llama.cpp built"    $BIN/llama-perplexity      "build 120"
-    mark "eval corpus"        $EVAL                      "get_eval"
-
-    if find /gguf -name "*.gguf" 2>/dev/null | grep -qi bf16; then
-        echo "  [x] bf16 on disk"
-    else
-        echo "  [ ] bf16 on disk       ->  run:  get_bf16      (box 1 only)"
-    fi
-
-    if ls /gguf/*.gguf >/dev/null 2>&1; then
-        echo "  [x] quants on disk: $(ls /gguf/*.gguf | wc -l) files"
-    else
-        echo "  [ ] quants on disk     ->  run:  get_quants    (box 2 only)"
-    fi
-
-    mark "reference built"    $BASE                      "base   (box 1)  or  get_base / wait_base   (box 2)"
-
-    KLDS=$(ls /logs/kld-*.log 2>/dev/null | wc -l)
-    echo "  [$([ $KLDS -gt 0 ] && echo x || echo ' ')] kld logs: $KLDS       ->  run:  kld_all"
-    BENCHES=$(ls /logs/bench-*.json 2>/dev/null | wc -l)
-    echo "  [$([ $BENCHES -gt 0 ] && echo x || echo ' ')] bench logs: $BENCHES     ->  run:  bench_all"
-    mark "results.json"       /logs/results.json         "results"
-
-    echo
-    echo "  imatrix:"
-    if [ -f /eval/calib_train.txt ]; then
-        echo "    [x] calibration corpus"
-    else
-        echo "    [ ] calibration corpus  ->  run:  get_calib <recipe-name>"
-        echo "                                for a model we never did:  new_model NAME REPO"
-    fi
-    if [ -n "$IM_MODEL" ] && [ -f "$IM_MODEL" ]; then
-        echo "    [x] IM_MODEL: $(basename $IM_MODEL)"
-    else
-        echo "    [ ] IM_MODEL not set    ->  run:  pick_model"
-    fi
-    SHARDS=$(ls /imatrix/shard-*.gguf 2>/dev/null | wc -l)
-    if [ -f /imatrix/imatrix.gguf ]; then
-        echo "    [x] imatrix merged"
-    elif [ "$SHARDS" -gt 0 ]; then
-        echo "    [~] $SHARDS shard(s) here  ->  run:  im_merge N   once every node is done"
-    else
-        echo "    [ ] no imatrix          ->  run:  im_plan N, then im_shard I N on each box"
-    fi
-
-    echo
-    echo "  uploaded to $METRICS:"
-    if [ -z "$METRICS" ]; then
-        echo "    no preset loaded"
-    else
-        python3 - "$METRICS" "$METRICS_KIND" "$EVALSET" << 'UPEOF'
-import sys
-from huggingface_hub import HfApi
-metrics, kind, evalset = sys.argv[1:4]
-try:
-    files = set(HfApi().list_repo_files(metrics, repo_type=kind))
-except Exception as e:
-    print("    cannot read the repo: %s" % e)
-    print("    if it says 404, flip METRICS_KIND between dataset and model")
-    sys.exit(0)
-
-def row(label, present, cmd):
-    print("    [%s] %-22s %s" % ("x" if present else " ",
-                                 label,
-                                 "" if present else "->  run:  " + cmd))
-
-row("base log", "logs/base-%s.log" % evalset in files, "push_base")
-row("environment", "logs/env.txt" in files, "push_base")
-kld = [f for f in files if f.startswith("logs/kld-")]
-row("kld logs (%d)" % len(kld), bool(kld), "push_logs")
-bench = [f for f in files if f.startswith("logs/bench-")]
-row("bench logs (%d)" % len(bench), bool(bench), "push_logs")
-row("results.json", "results.json" in files, "push_results")
-UPEOF
-    fi
-
-    echo
-    echo "  full command list: help_me      pick by number: menu"
-    echo "  remote view: plan               new tmux panes: persist_shell"
-    echo
-}
-
-menu() {
-    echo
-    echo "  model    : ${MAIN:-none, pick a preset first}"
-    echo "  eval set : $EVALSET   context: $CTX"
-    echo
-    PS3="
-number: "
-    select picked in \
-        "use_nemotron" "use_qwen" \
-        "get_eval_set neutral" "get_eval_set agentic" "get_eval_set code" \
-        "plan" "status" "help_me" \
-        "cuda_check" "gpu_test" "setup" "build 120" \
-        "get_bf16" "get_quants" "find_bf16" "eval_size" \
-        "base" "kld_all" "bench_all" "results" \
-        "pick_model" "im_size" "im_plan 4" "im_merge 4" \
-        "push_base" "push_logs" "push_results" \
-        "ls_main" "ls_metrics" "ls_corpora" \
-        "quit"
-    do
-        if [ "$picked" = "quit" ] || [ -z "$picked" ]; then
-            break
-        fi
-        echo "--> $picked"
-        eval "$picked"
-        break
-    done
-}
-
-help_me() {
-cat << 'HELP_EOF'
-
-PRESET
-  use_nemotron / use_qwen    load repo names
-  show_preset
-
-ORIENTATION
-  plan                       what exists on disk AND in both repos, and what
-                             command to run next. Start here.
-  status                     local checklist only
-  ls_main / ls_metrics       list a remote repo with file sizes
-  menu                       pick a command by number
-  help_me                    this list
-  reload                     re-pull this script from github
-  persist_shell              auto-source this in every new tmux pane
-
-BOX SETUP
-  check                      disk, GPUs, cores, RAM
-  cuda_check                 toolkit vs host driver, writes /logs/env.txt
-  fix_cuda_compat            drop compat libs when the host driver is newer
-  setup                      apt + hugging face cli
-  build 120                  compile. 120 blackwell, 90 hopper, 89 ada, 86 ampere
-  gpu_test                   does ggml actually see the GPUs
-
-A MODEL WE HAVE NEVER QUANTIZED BEFORE
-  new_model NAME REPO        template check plus a fully filled in recipe
-  make_recipe NAME REPO      just the recipe, every field read from the hub
-
-CALIBRATION CORPUS
-  ls_corpora                 what is in AtomicChat/calib-corpora
-  get_recipe NAME            pull a recipe yaml and print it
-  corpus_check DIR_OR_REPO   render the model chat template against system,
-                             user, assistant, tool_call and tool_response, then
-                             check every emitted marker is a real single token.
-                             Run this BEFORE building a corpus for a new model.
-
-DOWNLOAD, each one asks before pulling anything
-  get_eval                   the neutral held-out corpus
-  get_eval_set NAME          neutral | agentic | code. Switches every derived
-                             path, so sets never overwrite each other
-  use_evalset NAME           switch sets without downloading
-  eval_size                  bytes, token estimate, chunk count at the current ctx
-  set_ctx N                  change the evaluation context
-  get_bf16                   the reference weights, sharded or not
-  get_quants                 every published quant, no bf16, no sidecars
-  get_one "PATTERN"          one file by glob
-  get_base                   pull an existing reference from the metrics repo
-  find_bf16                  locate the bf16 file already on disk
-  quant_files                list exactly what will be measured, nothing else
-  INCLUDE_EXPERIMENTAL=1     also measure everything under /gguf/experimental
-
-BUILD A BF16 THAT DOES NOT EXIST YET   (Qwen case, not Nemotron)
-  get_upstream               original safetensors from UPSTREAM into /src
-  setup_convert              torch and friends for the converter
-  make_bf16                  convert /src into a bf16 gguf
-  push_model_split FILE      publish it, split at 45 GB
-
-MEASURE
-  base                       write the reference into /kld/base-<set>.kld
-  kld MODEL                  one quant against the reference
-  kld_all                    every .gguf in /gguf
-  bench MODEL                llama-bench, GPU 0 only, json out
-  bench_all
-  gen MODEL NGL "EXTRA"      llama-cli, 400 tokens, fixed seed
-
-IMATRIX, split across as many boxes as you like
-  get_calib NAME             the calibration corpus for a recipe build
-  IM_MODEL=/gguf/x.gguf      the model the imatrix is collected on
-  im_size                    tokens and total chunk count
-  pick_model                 choose IM_MODEL from a numbered list, bf16 first
-  im_plan N                  prints the command for each of N nodes
-  im_shard I N               node I of N. Uploads its shard when done
-  im_merge N                 pulls every shard, merges, uploads the result
-  im_stats FILE              sum of squared activations, for cross checking
-
-RESULTS
-  results                    parse all logs into /logs/results.json
-
-UPLOAD, one job each
-  token_check                is HF_TOKEN real and does the hub accept it
-  make_metrics               create the metrics repo if it does not exist
-  repo_ok                    check the metrics repo is reachable
-  get_tools                  clone calib-corpora with recipes and pipeline
-  push_base                  reference logits, manifest, README, logs -> metrics
-  HASH_BLOB=1                also sha256 the blob, off by default: it reads the
-                             whole file and the hub already verifies transport
-                             splits into 45 GB parts when over the limit
-  send_base user@host PORT   ship the reference straight to another box
-  use_gpus 0,1               how many GPUs the quant runs may use
-  AUTOPUSH=0                 stop uploading every log as it is written
-  push_logs                  everything in /logs   -> metrics repo
-  push_results               results.json          -> metrics repo
-  push_model FILE            one gguf              -> main repo
-  push_model_split FILE      split at 45 GB first  -> main repo
-  push_card FILE             a README.md           -> main repo
-
-FLOWS, these just call the steps above in order
-  run_base_box               box 1: eval, bf16, reference, upload
-  run_quant_box              box 2: eval, quants, wait for reference, measure
-
-HELP_EOF
-}
-
-
-# ================================================================== box setup
-
-check() {
-    echo "=== free space on / ==="
-    df -h /
-    echo
-    echo "=== GPUs ==="
-    nvidia-smi --query-gpu=index,name,memory.total --format=csv
-    echo
-    echo "=== cores / RAM ==="
-    nproc
-    free -g | head -2
-    echo
-    echo "bf16 needs ~96 GB VRAM. Q8_0 needs ~40."
-}
-
-cuda_check() {
-    mkdir -p /logs
-    echo "=== toolkit in the container ==="
-    nvcc --version | tail -2
-    echo
-    echo "=== host driver ==="
-    nvidia-smi --query-gpu=name,driver_version --format=csv
-    echo
-    echo "=== forward compatibility libraries ==="
-    COMPAT_LIB=$(ls /usr/local/cuda/compat/libcuda.so.*.* 2>/dev/null | head -1)
-    if [ -z "$COMPAT_LIB" ]; then
-        echo "none present, nothing to do"
-    else
-        COMPAT_MAJOR=$(basename $COMPAT_LIB | sed "s/libcuda.so.//" | cut -d. -f1)
-        HOST_MAJOR=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1)
-        echo "compat libs target driver $COMPAT_MAJOR, host driver is $HOST_MAJOR"
-        if [ "$HOST_MAJOR" -ge "$COMPAT_MAJOR" ]; then
-            echo "Host driver is newer or equal, so these libs can only break CUDA init."
-            fix_cuda_compat
-        else
-            echo "Host driver is older, so these libs are needed. Leaving them alone."
-        fi
-    fi
-
-    {
-        grep PRETTY_NAME /etc/os-release
-        nvcc --version | tail -2
-        nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
-    } > /logs/env.txt
-    echo
-    echo "written to /logs/env.txt, it ships to the metrics repo with push_logs"
-}
-
-fix_cuda_compat() {
-    rm -rf /usr/local/cuda*/compat
-    ldconfig
-    echo "Compat libraries removed. The host driver now wins."
-}
-
-setup_convert() {
-    echo "This installs torch and friends so convert_hf_to_gguf.py can run."
-    echo "Around 3 GB of downloads. Only needed when we have to BUILD a bf16 gguf."
-    ask "install?" || return 1
-    pip install --break-system-packages -q -U -r /llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
-    echo "done"
-}
 
 setup() {
     apt-get update -qq
@@ -560,9 +171,11 @@ build() {
 
     cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$1
-    cmake --build build -j $(nproc) --target llama-perplexity llama-bench llama-cli llama-gguf-split
+    cmake --build build -j $(nproc) --target \
+        llama-perplexity llama-bench llama-cli llama-gguf-split \
+        llama-imatrix llama-quantize
 
-    ls -la $BIN/llama-perplexity $BIN/llama-bench $BIN/llama-cli $BIN/llama-gguf-split
+    ls -la $BIN/
     echo
     echo "Now run gpu_test."
 }
@@ -835,6 +448,23 @@ get_eval() {
     get_eval_set neutral
 }
 
+# The corpus is built on one box and pulled by the rest. This polls until it
+# lands, so the other boxes can be started at the same time.
+wait_calib() {
+    if [ -z "$1" ]; then
+        echo "wait_calib NAME"
+        return 1
+    fi
+    echo "polling AtomicChat/calib-corpora for builds/$1. Ctrl-C to stop."
+    while true; do
+        if get_calib $1 2>/dev/null; then
+            return 0
+        fi
+        echo "not built yet, $(date +%H:%M:%S), retry in 30s"
+        sleep 30
+    done
+}
+
 eval_size() {
     if [ ! -f $EVAL ]; then
         echo "no corpus at $EVAL"
@@ -975,21 +605,27 @@ if not template:
     sys.exit(1)
 print("ok    chat template found in %s, %d chars" % (where, len(template)))
 
-# every construct we calibrate on
-convo = [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "What is the weather in Paris?"},
-    {"role": "assistant", "content": "", "tool_calls": [
-        {"type": "function", "function": {"name": "get_weather",
-         "arguments": '{"city": "Paris"}'}}]},
-    {"role": "tool", "content": '{"temp_c": 19}'},
-    {"role": "assistant", "content": "It is 19 degrees in Paris."},
-]
+# Every construct we calibrate on. Templates disagree about the shape of a tool
+# call, so try the common ones and report which one this model accepts: the
+# pool records have to match it or the agentic slice renders with no tool
+# markup at all.
+def convo(args_as_dict, tool_role="tool"):
+    args = {"city": "Paris"} if args_as_dict else '{"city": "Paris"}'
+    return [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"type": "function", "function": {"name": "get_weather", "arguments": args}}]},
+        {"role": tool_role, "content": '{"temp_c": 19}', "name": "get_weather"},
+        {"role": "assistant", "content": "It is 19 degrees in Paris."},
+    ]
+
 tools = [{"type": "function", "function": {
     "name": "get_weather",
     "description": "Get the weather for a city",
     "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
                    "required": ["city"]}}}]
+tools_bare = [t["function"] for t in tools]
 
 from jinja2 import Environment
 from jinja2.exceptions import TemplateError
@@ -1001,28 +637,44 @@ except Exception as e:
     print("FAIL  the template does not even parse as jinja: %s" % e)
     sys.exit(1)
 
+attempts = [
+    ("tool_calls arguments as a DICT, tools wrapped in type/function",
+     dict(messages=convo(True), tools=tools, add_generation_prompt=True)),
+    ("tool_calls arguments as a DICT, bare function schemas",
+     dict(messages=convo(True), tools=tools_bare, add_generation_prompt=True)),
+    ("tool_calls arguments as a JSON STRING",
+     dict(messages=convo(False), tools=tools, add_generation_prompt=True)),
+    ("no tools at all",
+     dict(messages=convo(True)[:2] + convo(True)[4:], add_generation_prompt=True)),
+]
+
 rendered = None
-for kwargs in (
-    {"messages": convo, "tools": tools, "add_generation_prompt": True},
-    {"messages": convo, "add_generation_prompt": True},
-    {"messages": convo[:2] + convo[4:], "add_generation_prompt": True},
-):
+winner = None
+for label, kwargs in attempts:
     try:
-        rendered = tpl.render(bos_token="", eos_token="", **kwargs)
-        keys = ", ".join(k for k in kwargs if k != "messages")
-        print("ok    renders with: %s" % (keys or "messages only"))
+        out = tpl.render(bos_token="", eos_token="", **kwargs)
+    except Exception as e:
+        print("  no    %-56s %s" % (label, str(e)[:60]))
+        continue
+    has_tool = "get_weather" in out
+    print("  ok    %-56s tool markup: %s" % (label, "yes" if has_tool else "NO"))
+    if rendered is None or (has_tool and "get_weather" not in rendered):
+        rendered, winner = out, label
+    if has_tool:
         break
-    except (TemplateError, Exception) as e:
-        print("      render failed with %s: %s" % (list(kwargs), e))
 
 if rendered is None:
     print("FAIL  the template will not render any of our conversations")
     sys.exit(1)
 
-if "tool" not in rendered.lower():
-    print("warn  the rendered text has no trace of the tool call. Either the")
-    print("      template ignores tools, or it wants a different message shape.")
-    print("      Agentic and tool data in the corpus will not exercise it.")
+print()
+print("using: %s" % winner)
+if "get_weather" not in rendered:
+    print()
+    print("WARNING  no shape produced tool markup. The agentic slice of the")
+    print("         corpus would render with none of it, and the imatrix would")
+    print("         have no statistics for the tool token set at all.")
+    print("         Check how the pool stores tool_calls before building.")
 
 # which markers does it emit, and are they real tokens
 markers = sorted(set(re.findall(r"<\|[^|>]{1,40}\|>|<[a-z_]{2,20}>|\[/?[A-Z_]{2,20}\]", rendered)))
@@ -1049,24 +701,28 @@ if add_raw:
         pass
 
 print()
-print("markers the template emits, and whether they are single tokens:")
-bad = []
+print("markers the template emits:")
+special, plain = [], []
 for m in markers:
-    if m in known:
-        print("  ok    %s" % m)
-    else:
-        print("  BAD   %s   not in the vocabulary" % m)
-        bad.append(m)
+    (special if m in known else plain).append(m)
+
+for m in special:
+    print("  special token   %s" % m)
+for m in plain:
+    print("  plain text      %s" % m)
 
 print()
-if bad:
-    print("RESULT  %d markers are not real tokens." % len(bad))
-    print("        They will tokenize as literal punctuation, several tokens each,")
-    print("        and that part of the corpus calibrates nothing useful.")
-    print("        Fix the corpus rendering before running llama-imatrix.")
+if not special:
+    print("WARNING  not one marker is a real token. That usually means this is")
+    print("         not the model's own template, or the tokenizer files do not")
+    print("         match the weights. Do not build a corpus on this.")
 else:
-    print("RESULT  every marker is a real single token.")
-    print("        Run llama-imatrix with --parse-special or all of this is wasted.")
+    print("RESULT  %d real special tokens, %d plain text delimiters." % (len(special), len(plain)))
+    print("        Plain delimiters are fine: the model was trained on this same")
+    print("        template, so it reads them as ordinary text at inference too,")
+    print("        and the corpus matches. What matters is the special ones:")
+    print("        run llama-imatrix with --parse-special or they get tokenized")
+    print("        as punctuation and that part of the corpus calibrates nothing.")
 print()
 print("first 600 chars of the rendered conversation, eyeball it:")
 print("-" * 60)
@@ -1211,9 +867,10 @@ from huggingface_hub import hf_hub_download
 
 name, repo = sys.argv[1], sys.argv[2]
 
-# build.py maps chat.format onto a renderer module through its FORMATTERS dict,
-# so this has to be a short key with a matching <key>_fmt.py, not the full name.
-fmt_key = re.match(r"[a-z]+", name).group(0) if re.match(r"[a-z]+", name) else name
+# build.py resolves chat.format through FORMATTERS. auto_fmt drives the model's
+# own template through transformers, so one renderer covers every model and no
+# per-model module has to be written.
+fmt_key = "auto"
 
 def grab(fn):
     try:
@@ -1333,9 +990,9 @@ model:
 seed: 20260814
 
 chat:
-  # build.py resolves this through FORMATTERS to tools/{fmt}_fmt.py.
-  # That module must exist and be registered there, or the build falls back
-  # to the default renderer and emits another model's markup.
+  # auto_fmt drives this model's own chat_template through transformers, so
+  # byte equality with inference holds by construction. Install it once with
+  # install_auto_fmt; no per-model renderer is needed.
   format: {fmt}
   add_bos_per_document: {add_bos}
 {date_pin}
@@ -1392,13 +1049,17 @@ notes:
 out = "/recipes/%s.yaml" % name
 open(out, "w").write(body)
 print()
+if vocab:
+    per_100k = vocab * 2 * 100000 / 1e9
+    print()
+    print("vocabulary is %d rows, so the kld reference costs about %.0f GB per" % (vocab, per_100k))
+    print("100k scored tokens. At ctx 4096 with a 400k token corpus that is")
+    print("roughly %.0f GB. Plan disk for it before running base." % (per_100k * 2))
+
 print("wrote %s" % out)
 print()
-print("two things this file cannot do for you:")
-print("  1. tools/%s_fmt.py must exist and be registered in FORMATTERS in" % fmt_key)
-print("     build.py, or the build renders with another model's markup")
-print("  2. the domain shares are a claim about what this model is for.")
-print("     Read them once.")
+print("one thing this file cannot do for you: the domain shares are a claim")
+print("about what this model is for. Read them once.")
 RECIPEEOF
 }
 
@@ -1411,10 +1072,15 @@ new_model() {
         return 1
     fi
     echo "=============== 1. chat template and special tokens ==============="
-    corpus_check $2
+    if ! corpus_check $2; then
+        echo
+        echo "Stopping. Nothing below can work without the model's own files."
+        echo "If the repo id is wrong, find it with:   find_repo <part of the name>"
+        return 1
+    fi
     echo
     echo "=============== 2. recipe ==============="
-    make_recipe $1 $2
+    make_recipe $1 $2 || return 1
     echo
     echo "=============== 3. next ==============="
     echo "  cat /recipes/$1.yaml"
@@ -1448,6 +1114,139 @@ number: "
         ls -lh $IM_MODEL
         break
     done
+}
+
+
+# ================================================================== corpus build
+
+# One generic renderer instead of one per model. Installs auto_fmt.py into the
+# pipeline and registers it in build.py's FORMATTERS.
+install_auto_fmt() {
+    if [ ! -d /calib-corpora ]; then
+        echo "no pipeline yet. Run get_tools."
+        return 1
+    fi
+    curl -sL https://raw.githubusercontent.com/worthant/quantizer/main/auto_fmt.py \
+        -o /calib-corpora/tools/auto_fmt.py || return 1
+
+    if grep -q '"auto"' /calib-corpora/tools/build.py; then
+        echo "already registered in FORMATTERS"
+    else
+        sed -i 's/^FORMATTERS = {/FORMATTERS = {\n    "auto":     "auto_fmt",/' \
+            /calib-corpora/tools/build.py
+        echo "registered in FORMATTERS"
+    fi
+    sed -n '/^FORMATTERS = {/,/^}/p' /calib-corpora/tools/build.py
+}
+
+setup_corpus() {
+    pip install --break-system-packages -q -U transformers pyyaml jinja2 sentencepiece
+    python3 -c "import transformers; print('transformers', transformers.__version__)"
+    echo "If a converter later complains about RoPE, pin transformers below 5."
+}
+
+# build_corpus NAME
+# Needs: the original weights in /src, the recipe in /recipes, get_tools done.
+build_corpus() {
+    if [ -z "$1" ]; then
+        echo "build_corpus NAME        e.g. build_corpus qwen3.8-27b"
+        return 1
+    fi
+    NAME=$1
+
+    if [ ! -f /src/tokenizer.json ]; then
+        echo "no tokenizer at /src/tokenizer.json. Run get_upstream."
+        return 1
+    fi
+    if [ ! -d /calib-corpora ]; then
+        echo "no pipeline. Run get_tools."
+        return 1
+    fi
+    if [ ! -f /calib-corpora/tools/auto_fmt.py ]; then
+        echo "generic renderer not installed. Run install_auto_fmt."
+        return 1
+    fi
+    if [ ! -f /recipes/$NAME.yaml ]; then
+        echo "no recipe at /recipes/$NAME.yaml. Run make_recipe or new_model."
+        return 1
+    fi
+
+    export FOUNDRY_MODEL_DIR=/src
+    PIN=$(grep -o 'pin_date: *"[^"]*"' /recipes/$NAME.yaml | cut -d'"' -f2)
+    if [ -n "$PIN" ]; then
+        export FOUNDRY_PIN_DATE=$PIN
+        echo "date pinned to $PIN, so this build is reproducible"
+    fi
+
+    cp /recipes/$NAME.yaml /calib-corpora/recipes/
+    cd /calib-corpora
+
+    check_pool || return 1
+
+    echo
+    echo "=============== vocabulary sweep for THIS tokenizer ==============="
+    echo "A sweep built for another model covers a different vocabulary and is"
+    echo "worthless here, so this is regenerated every time."
+
+    BEFORE=$(git -C /calib-corpora status --porcelain pool/vocab_sweep | md5sum)
+    python3 tools/vocab_sweep.py --tokenizer /src/tokenizer.json 2>&1 | tee /logs/vocab-sweep-$NAME.log
+
+    echo
+    echo "what the sweep touched:"
+    git -C /calib-corpora status --porcelain pool/vocab_sweep
+    TOUCHED=$(git -C /calib-corpora status --porcelain pool/vocab_sweep | awk '{print $2}')
+    for f in $TOUCHED; do
+        case "$f" in
+            *$NAME*) ;;
+            *) echo
+               echo "!! $f is not named after $NAME."
+               echo "   The sweep wrote over another model's file. That file is"
+               echo "   built for a different vocabulary and is now gone."
+               echo "   Restore it and give vocab_sweep an output name:"
+               echo "     git -C /calib-corpora checkout -- $f"
+               echo "     python3 tools/vocab_sweep.py --help"
+               return 1 ;;
+        esac
+    done
+
+    echo
+    echo "=============== building the corpus ==============="
+    date
+    python3 tools/build.py --recipe recipes/$NAME.yaml 2>&1 | tee /logs/build-$NAME.log
+    date
+
+    echo
+    echo "=============== what appeared ==============="
+    ls -la /calib-corpora/builds/$NAME/ 2>/dev/null || find /calib-corpora/builds -newer /calib-corpora/recipes/$NAME.yaml
+
+    if [ -f /calib-corpora/builds/$NAME/calib_train.txt ]; then
+        cp /calib-corpora/builds/$NAME/calib_train.txt $IM_CORPUS
+        im_size
+        echo
+        echo "publish it so the other boxes can pull the same bytes:"
+        echo "  push_corpus $NAME"
+    fi
+    cd -
+}
+
+push_corpus() {
+    if [ -z "$1" ]; then
+        echo "push_corpus NAME"
+        return 1
+    fi
+    token_check > /dev/null || return 1
+    if [ ! -d /calib-corpora/builds/$1 ]; then
+        echo "nothing was built at /calib-corpora/builds/$1"
+        echo "run build_corpus $1 first, and read its output"
+        return 1
+    fi
+    cd /calib-corpora
+    hf upload AtomicChat/calib-corpora --repo-type dataset \
+        builds/$1 builds/$1
+    hf upload AtomicChat/calib-corpora --repo-type dataset \
+        recipes/$1.yaml recipes/$1.yaml
+    cd -
+    echo "every box can now: get_calib $1"
 }
 
 
@@ -1519,6 +1318,43 @@ im_shard() {
         return 1
     fi
     im_size || return 1
+
+    # The logits tensor is batch x vocab x 4 bytes and lives in VRAM alongside
+    # the weights. A batch tuned for a small vocabulary will OOM on a large one.
+    VOCAB=$(python3 -c "
+import sys
+sys.path.insert(0, '/llama.cpp/gguf-py')
+from gguf import GGUFReader
+r = GGUFReader('$IM_MODEL')
+for t in r.tensors:
+    if 'token_embd' in t.name or t.name == 'output.weight':
+        print(int(t.shape[1]) if len(t.shape) > 1 else 0); break
+else:
+    print(0)
+" 2>/dev/null)
+    if [ -n "$VOCAB" ] && [ "$VOCAB" -gt 0 ]; then
+        LOGIT_GB=$(( VOCAB * IM_BATCH * 4 / 1000000000 ))
+        MODEL_GB=$(( $(stat -c %s $IM_MODEL) / 1000000000 ))
+        # Only the cards this process can see. Two shards on one box each get
+        # their own pair through CUDA_VISIBLE_DEVICES, so counting all of them
+        # would say everything fits when it does not.
+        PER_GPU=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
+        if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+            NGPU=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
+        else
+            NGPU=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | wc -l)
+        fi
+        VRAM_GB=$(( PER_GPU * NGPU / 1000 ))
+        echo "visible GPUs: ${CUDA_VISIBLE_DEVICES:-all} ($NGPU cards)"
+        echo "vocabulary $VOCAB, batch $IM_BATCH"
+        echo "weights ~${MODEL_GB} GB + logits ~${LOGIT_GB} GB against ${VRAM_GB} GB of VRAM"
+        if [ $(( MODEL_GB + LOGIT_GB + 4 )) -gt $VRAM_GB ]; then
+            echo
+            echo "That does not fit. Lower the batch and try again:"
+            echo "  IM_BATCH=2048 ; im_shard $1 $2"
+            return 1
+        fi
+    fi
 
     I=$1
     N=$2
@@ -1595,6 +1431,44 @@ im_merge() {
     hf upload $METRICS --repo-type $METRICS_KIND /imatrix/imatrix.gguf imatrix/imatrix.gguf
 }
 
+# Block until the corpus this build needs shows up in the dataset.
+wait_calib() {
+    if [ -z "$1" ]; then
+        echo "wait_calib NAME"
+        return 1
+    fi
+    echo "waiting for builds/$1/calib_train.txt in calib-corpora. Ctrl-C to stop."
+    while true; do
+        if fetch_one AtomicChat/calib-corpora dataset "builds/$1/calib_train.txt" $IM_CORPUS 2>/dev/null; then
+            im_size
+            return 0
+        fi
+        echo "not published yet, $(date +%H:%M:%S), retry in 20s"
+        sleep 20
+    done
+}
+
+# Block until every node has uploaded its shard, then merge.
+im_wait_merge() {
+    if [ -z "$1" ]; then
+        echo "im_wait_merge N"
+        return 1
+    fi
+    need_preset || return 1
+    N=$1
+    echo "waiting for $N shards in $METRICS. Ctrl-C to stop."
+    while true; do
+        hf download $METRICS --repo-type $METRICS_KIND --include "imatrix/*" --local-dir /imatrix > /dev/null 2>&1
+        GOT=$(find /imatrix -name "shard-*-of-$N.gguf" 2>/dev/null | wc -l)
+        echo "  $GOT of $N here, $(date +%H:%M:%S)"
+        if [ "$GOT" -ge "$N" ]; then
+            break
+        fi
+        sleep 20
+    done
+    im_merge $N
+}
+
 im_stats() {
     if [ -z "$1" ]; then
         echo "im_stats FILE.gguf"
@@ -1604,74 +1478,327 @@ im_stats() {
 }
 
 
+# ================================================================== bit accounting
+
+# bits [RULE ...]
+# Reads the bf16 gguf, groups the tensors by role, and shows how much of the
+# model each group actually is. With rules it also predicts the output size,
+# so a target ("must fit 16 GB") can be solved before spending ten minutes
+# quantizing to find out.
+#
+#   bits
+#   bits 'ffn_down_exps=iq3_s' 'ffn_up_exps=iq2_m' '*=q8_0'
+bits() {
+    find_bf16 || return 1
+    python3 - "$BF16_FIRST" "$@" << 'BITSEOF'
+import fnmatch, sys, os
+sys.path.insert(0, "/llama.cpp/gguf-py")
+from gguf import GGUFReader
+
+path, rules_raw = sys.argv[1], sys.argv[2:]
+
+# Nominal bits per weight. Real files differ slightly because of per-tensor
+# fallbacks, but this is close enough to aim a size at.
+BPW = {
+    "f32": 32.0, "f16": 16.0, "bf16": 16.0,
+    "q8_0": 8.5, "q6_k": 6.5625, "q5_1": 6.0, "q5_k": 5.5, "q5_0": 5.5,
+    "q4_k": 4.5, "q4_0": 4.5, "iq4_nl": 4.5, "iq4_xs": 4.25,
+    "mxfp4": 4.25, "nvfp4": 4.5,
+    "q3_k": 3.4375, "iq3_s": 3.4375, "iq3_xxs": 3.0625,
+    "iq2_m": 2.6875, "q2_k": 2.625, "iq2_s": 2.5, "iq2_xs": 2.3125,
+    "q2_0": 2.25, "iq2_xxs": 2.0625,
+    "iq1_m": 1.75, "iq1_s": 1.5625, "q1_0": 1.125,
+}
+
+# Types that never read the importance matrix, whatever you pass.
+BLIND = {"q2_0", "mxfp4", "nvfp4", "q8_0", "f16", "bf16", "f32", "q1_0"}
+
+reader = GGUFReader(path)
+
+def group_of(name):
+    for key in ("ffn_down_exps", "ffn_up_exps", "ffn_gate_exps",
+                "ffn_down_shexp", "ffn_up_shexp", "ffn_gate_shexp",
+                "ffn_down", "ffn_up", "ffn_gate", "ffn_gate_inp",
+                "attn_q", "attn_k", "attn_v", "attn_output", "attn_norm",
+                "token_embd", "output"):
+        if key in name:
+            return key
+    return "other"
+
+groups = {}
+for t in reader.tensors:
+    n = 1
+    for d in t.shape:
+        n *= int(d)
+    g = groups.setdefault(group_of(t.name), {"elems": 0, "count": 0, "ne0": set()})
+    g["elems"] += n
+    g["count"] += 1
+    g["ne0"].add(int(t.shape[0]))
+
+total = sum(g["elems"] for g in groups.values())
+
+print("%-18s %6s %14s %7s   %s" % ("group", "count", "elements", "share", "row length / 256 / 64 / 32"))
+for name, g in sorted(groups.items(), key=lambda kv: -kv[1]["elems"]):
+    ne0s = sorted(g["ne0"])[:3]
+    div = " ".join(
+        "%d(%s%s%s)" % (v,
+                        "K" if v % 256 == 0 else "-",
+                        "6" if v % 64 == 0 else "-",
+                        "3" if v % 32 == 0 else "-")
+        for v in ne0s)
+    print("%-18s %6d %14d %6.1f%%   %s" % (
+        name, g["count"], g["elems"], 100.0 * g["elems"] / total, div))
+print()
+print("K = row divides by 256, so k and i quants work on it")
+print("6 = divides by 64,  3 = divides by 32")
+print("A group without K cannot hold any k/i quant: llama.cpp silently swaps in")
+print("a block-32 type and keeps the name you asked for.")
+
+if not rules_raw:
+    print()
+    print("pass rules to predict a size, e.g.")
+    print("  bits 'ffn_down_exps=iq3_s' 'ffn_up_exps=iq2_m' '*=q8_0'")
+    sys.exit(0)
+
+rules = []
+for r in rules_raw:
+    pat, _, ty = r.partition("=")
+    rules.append((pat.strip(), ty.strip().lower()))
+
+def type_for(name):
+    for pat, ty in rules:
+        if pat == "*" or fnmatch.fnmatch(name, pat) or pat in name:
+            return ty
+    return "q8_0"
+
+print()
+print("%-18s %-10s %8s %10s" % ("group", "type", "bpw", "GB"))
+bytes_total = 0.0
+warned = []
+for name, g in sorted(groups.items(), key=lambda kv: -kv[1]["elems"]):
+    ty = type_for(name)
+    bpw = BPW.get(ty)
+    if bpw is None:
+        print("%-18s %-10s   unknown type" % (name, ty))
+        continue
+    gb = g["elems"] * bpw / 8 / 1e9
+    bytes_total += gb
+    print("%-18s %-10s %8.3f %10.2f" % (name, ty, bpw, gb))
+
+    ne0 = sorted(g["ne0"])[0]
+    if ty in ("q2_k", "q3_k", "q4_k", "q5_k", "q6_k") or ty.startswith("iq"):
+        if ty != "iq4_nl" and ne0 % 256 != 0:
+            warned.append("%s: %s needs rows divisible by 256, %d is not. "
+                          "llama.cpp will fall back and the file will be bigger "
+                          "and worse than this estimate." % (name, ty, ne0))
+    if ty in BLIND and g["elems"] > total * 0.1:
+        warned.append("%s: %s ignores the importance matrix, and this group is "
+                      "%.0f%% of the model. Calibration buys nothing here."
+                      % (name, ty, 100.0 * g["elems"] / total))
+
+print("-" * 50)
+print("%-18s %-10s %8s %10.2f GB" % ("TOTAL", "", "", bytes_total))
+print("%-18s %-10s %8s %10.2f GiB" % ("", "", "", bytes_total * 1e9 / 2**30))
+if warned:
+    print()
+    for w in warned:
+        print("!! " + w)
+BITSEOF
+}
+
+
+# ================================================================== quantize
+
+# quantize LABEL FALLBACK_TYPE [--tensor-type RULE ...]
+# The fallback type covers everything no rule matches. Rules do the real work:
+# the expert tensors are most of the model, so they decide the file size, and
+# everything else is cheap to keep high.
+#
+#   quantize AD-IQ4_NL Q8_0 \
+#     --tensor-type 'ffn_down_exps=iq4_nl' \
+#     --tensor-type 'ffn_up_exps=iq4_nl'
+quantize() {
+    if [ -z "$2" ]; then
+        echo "quantize LABEL FALLBACK_TYPE [--tensor-type RULE ...]"
+        echo "  quantize AD-IQ4_NL Q8_0 --tensor-type 'ffn_down_exps=iq4_nl' \\"
+        echo "                          --tensor-type 'ffn_up_exps=iq4_nl'"
+        return 1
+    fi
+    need_preset || return 1
+    find_bf16 || return 1
+
+    LABEL=$1
+    FTYPE=$2
+    shift 2
+
+    STEM=$(basename $MAIN | sed "s/-GGUF//")
+    OUT=/gguf/$STEM-$LABEL.gguf
+
+    IM=""
+    if [ -f /imatrix/imatrix.gguf ]; then
+        IM="--imatrix /imatrix/imatrix.gguf"
+        echo "using /imatrix/imatrix.gguf"
+    else
+        echo "NO IMATRIX. This will be an uncalibrated build."
+        ask "continue without calibration?" || return 1
+    fi
+
+    echo "$BF16_FIRST  ->  $OUT   fallback $FTYPE"
+    date
+    START=$(date +%s)
+
+    $BIN/llama-quantize $IM "$@" $BF16_FIRST $OUT $FTYPE $(nproc) \
+        2>&1 | tee /logs/quantize-$LABEL.log
+
+    echo "took $(( $(date +%s) - START )) seconds"
+    ls -lh $OUT
+    autopush /logs/quantize-$LABEL.log logs/quantize-$LABEL.log
+    echo
+    echo "publish it with:  push_model $OUT"
+}
+
+# Pull somebody else's build so it can be measured against the same reference.
+# Comparisons across different references mean nothing.
+get_external() {
+    if [ -z "$2" ]; then
+        echo "get_external REPO PATTERN"
+        echo "  get_external ggml-org/Some-Model-GGUF '*NVFP4*'"
+        return 1
+    fi
+    mkdir -p /gguf/external
+    hf download $1 --include "$2" --local-dir /gguf/external
+    ls -la /gguf/external
+    echo
+    echo "measure it with:  kld /gguf/external/<file>.gguf"
+}
+
+
 # ================================================================== results
 
 results() {
     python3 - << 'PYEOF'
-import glob, json, os, re
+import glob, json, os, re, socket
 
 def num(pattern, text):
     m = re.search(pattern, text)
     return float(m.group(1)) if m else None
 
-out = {}
+# One row per file. Quality and speed used to land in separate rows because
+# they were keyed differently; they are the same file measured two ways.
+rows = {}
+
+def row(name):
+    return rows.setdefault(name, {'name': name})
+
+failed = []
 
 for path in glob.glob('/logs/kld-*.log'):
     stem = os.path.basename(path)[4:-4]
-    if '--' in stem:
-        evalset, name = stem.split('--', 1)
-    else:
-        evalset, name = 'neutral', stem
+    evalset, name = stem.split('--', 1) if '--' in stem else ('neutral', stem)
     text = open(path, errors='ignore').read()
-    row = out.setdefault((evalset, name), {'name': name, 'eval_set': evalset})
-    row['mean_kld']   = num(r'Mean\s+KLD:\s+([0-9.]+)', text)
-    row['q99_kld']    = num(r'99\.0%\s+KLD:\s+([0-9.]+)', text)
-    row['median_kld'] = num(r'Median\s+KLD:\s+([0-9.]+)', text)
-    row['top1_pct']   = num(r'Same top p:\s+([0-9.]+)', text)
-    row['rms_dp_pct'] = num(r'RMS\s+.p\s*:\s+([0-9.]+)', text)
+    mean = num(r'Mean\s+KLD:\s+([0-9.]+)', text)
+    if mean is None:
+        failed.append(name)
+        continue
+    r = row(name)
+    r.setdefault('quality', {})[evalset] = {
+        'mean_kld':   mean,
+        'q99_kld':    num(r'99\.0%\s+KLD:\s+([0-9.]+)', text),
+        'median_kld': num(r'Median\s+KLD:\s+([0-9.]+)', text),
+        'top1_pct':   num(r'Same top p:\s+([0-9.]+)', text),
+        'rms_dp_pct': num(r'RMS\s+.p\s*:\s+([0-9.]+)', text),
+    }
 
 for path in glob.glob('/logs/bench-*.json'):
     name = os.path.basename(path)[6:-5]
-    row = out.setdefault(('speed', name), {'name': name, 'eval_set': 'speed'})
+    r = row(name)
     try:
         for entry in json.load(open(path)):
-            key = 'pp512' if entry.get('n_prompt', 0) > 0 else 'tg128'
-            row[key + '_tps'] = entry.get('avg_ts')
-            row['gpu'] = entry.get('gpu_info')
-            row['build'] = entry.get('build_commit')
+            key = 'pp512_tps' if entry.get('n_prompt', 0) > 0 else 'tg128_tps'
+            r[key] = entry.get('avg_ts')
+            r['gpu'] = entry.get('gpu_info')
+            r['build'] = entry.get('build_commit')
     except Exception as e:
-        row['bench_error'] = str(e)
+        r['bench_error'] = str(e)
 
-for key, row in out.items():
-    for folder in ('/gguf', '/gguf/experimental'):
-        p = os.path.join(folder, row['name'] + '.gguf')
+for name, r in rows.items():
+    for folder in ('/gguf', '/gguf/experimental', '/gguf/external'):
+        p = os.path.join(folder, name + '.gguf')
         if os.path.exists(p):
-            row['size_bytes'] = os.path.getsize(p)
-            row['size_gb'] = round(os.path.getsize(p) / 1e9, 2)
+            r['size_bytes'] = os.path.getsize(p)
+            r['size_gb'] = round(os.path.getsize(p) / 1e9, 2)
 
-failed = [r for r in out.values()
-          if r.get('eval_set') != 'speed' and r.get('mean_kld') is None]
-rows = [r for r in out.values() if r not in failed]
-rows = sorted(rows, key=lambda r: (r.get('eval_set') or '', r.get('size_gb') or 0))
-with open('/logs/results.json', 'w') as f:
-    json.dump(rows, f, indent=2)
+out = sorted(rows.values(), key=lambda r: r.get('size_gb') or 0)
+for r in out:
+    r['measured_on'] = socket.gethostname()
 
-print('%-9s %-44s %7s %10s %8s %8s' % ('set', 'file', 'GB', 'mean KLD', 'top-1', 'tg t/s'))
-for r in rows:
-    print('%-9s %-44s %7s %10s %8s %8s' % (
-        r.get('eval_set', ''), r['name'][:44],
-        r.get('size_gb', ''), r.get('mean_kld', ''),
-        r.get('top1_pct', ''), r.get('tg128_tps', '')))
+json.dump(out, open('/logs/results.json', 'w'), indent=2)
+
+sets = sorted({s for r in out for s in r.get('quality', {})})
+primary = 'neutral' if 'neutral' in sets else (sets[0] if sets else None)
+
+print('%-46s %7s %10s %8s %9s %9s' % ('file', 'GB', 'mean KLD', 'top-1', 'pp512', 'tg128'))
+for r in out:
+    q = r.get('quality', {}).get(primary, {})
+    print('%-46s %7s %10s %8s %9s %9s' % (
+        r['name'][-46:],
+        r.get('size_gb', ''),
+        round(q['mean_kld'], 6) if q.get('mean_kld') is not None else '',
+        round(q['top1_pct'], 2) if q.get('top1_pct') is not None else '',
+        round(r['pp512_tps'], 1) if r.get('pp512_tps') is not None else '',
+        round(r['tg128_tps'], 1) if r.get('tg128_tps') is not None else ''))
+
+if len(sets) > 1:
+    print()
+    print('eval sets in the file: %s (table shows %s)' % (', '.join(sets), primary))
 if failed:
     print()
-    print('%d run(s) produced no KLD, left out of results.json:' % len(failed))
-    for r in failed:
-        print('   ', r['name'])
-    print('check the matching log in /logs')
+    print('%d run(s) produced no KLD, left out:' % len(failed))
+    for n in failed:
+        print('   ', n)
 print()
 print('written to /logs/results.json')
 PYEOF
-    autopush /logs/results.json results.json
+    # Per box, so four boxes measuring different quants do not overwrite one
+    # another. merge_results stitches them back together.
+    autopush /logs/results.json results-$(hostname).json
+}
+
+# Pull every box's results file and stitch them into one.
+merge_results() {
+    need_preset || return 1
+    repo_ok || return 1
+    mkdir -p /merged
+    hf download $METRICS --repo-type $METRICS_KIND --include "results-*.json" --local-dir /merged
+    python3 - << 'MERGEEOF'
+import glob, json
+
+rows = {}
+for path in sorted(glob.glob('/merged/**/results-*.json', recursive=True)):
+    for r in json.load(open(path)):
+        cur = rows.setdefault(r['name'], {})
+        for k, v in r.items():
+            if k == 'quality':
+                cur.setdefault('quality', {}).update(v)
+            elif v is not None:
+                cur[k] = v
+
+out = sorted(rows.values(), key=lambda r: r.get('size_gb') or 0)
+json.dump(out, open('/logs/results.json', 'w'), indent=2)
+
+print('%-46s %7s %10s %8s %9s   %s' % ('file', 'GB', 'mean KLD', 'top-1', 'tg128', 'from'))
+for r in out:
+    q = r.get('quality', {}).get('neutral', {})
+    print('%-46s %7s %10s %8s %9s   %s' % (
+        r['name'][-46:], r.get('size_gb', ''),
+        round(q['mean_kld'], 6) if q.get('mean_kld') is not None else '',
+        round(q['top1_pct'], 2) if q.get('top1_pct') is not None else '',
+        round(r['tg128_tps'], 1) if r.get('tg128_tps') is not None else '',
+        r.get('measured_on', '')))
+print()
+print('%d files merged into /logs/results.json' % len(out))
+MERGEEOF
+    hf upload $METRICS --repo-type $METRICS_KIND /logs/results.json results.json
 }
 
 
@@ -1818,6 +1945,27 @@ send_base() {
     ls -lh $BASE
     rsync -avP -e "ssh -p ${2:-22} -o StrictHostKeyChecking=no" $BASE $1:$BASE
 }
+
+# Every box uploads its own logs as it goes, so merging results across boxes is
+# just pulling them all down and re-running the parser.
+pull_logs() {
+    need_preset || return 1
+    repo_ok || return 1
+    hf download $METRICS --repo-type $METRICS_KIND --include "logs/*" --local-dir /tmp/pulled
+    cp -n /tmp/pulled/logs/* /logs/ 2>/dev/null
+    ls /logs | wc -l
+    echo "logs in /logs now, running the parser over all of them"
+    results
+}
+
+get_imatrix() {
+    need_preset || return 1
+    hf download $METRICS --repo-type $METRICS_KIND --include "imatrix/imatrix.gguf" --local-dir /tmp/im
+    mkdir -p /imatrix
+    cp /tmp/im/imatrix/imatrix.gguf /imatrix/imatrix.gguf
+    ls -lh /imatrix/imatrix.gguf
+}
+
 
 push_logs() {
     need_preset || return 1
