@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.40
+FOUNDRY_VERSION=2026-08-14.41
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -2539,17 +2539,17 @@ quantize() {
     STEM=$(basename $MAIN | sed "s/-GGUF//")
     QUANT_OUT=/gguf/$STEM-$LABEL.gguf
 
-    # Pin the MTP block unless the caller already said something about it.
+    # Pin the MTP block unless the caller named that block specifically. The
+    # test used to be "does any argument mention blk", which every edge
+    # weighted rung does, so the pin was silently skipped and the run aborted
+    # partway through on the MTP tensors.
     local mtp
-    case "$*" in
-        *blk*) ;;
-        *) mtp=$(find_mtp_block)
-           if [ -n "$mtp" ]; then
-               echo "pinning the MTP block blk.$mtp to $MTP_TYPE: it collects no"
-               echo "imatrix data, so a low bit type would abort the run"
-               set -- --tensor-type "blk\.$mtp\.=$MTP_TYPE" "$@"
-           fi ;;
-    esac
+    mtp=$(find_mtp_block)
+    if [ -n "$mtp" ] && ! echo "$*" | grep -q "blk[\\.]*[.]$mtp[\\.]*[.]"; then
+        echo "pinning the MTP block blk.$mtp to $MTP_TYPE: it collects no"
+        echo "imatrix data, so a low bit type would abort the run"
+        set -- --tensor-type "blk\.$mtp\.=$MTP_TYPE" "$@"
+    fi
 
     IM=""
     if [ -f /imatrix/imatrix.gguf ]; then
@@ -2767,6 +2767,11 @@ ladder() {
 
     local line label fallback rules args r dry="" bad=0
     [ "$2" = "--dry" ] && dry=1
+
+    echo
+    echo "this run will build, in order:"
+    grep -v "^#" "$1" | grep "|" | cut -d"|" -f1 | tr -d " " | nl -w4 -s". " | sed "s/^/  /"
+    echo
 
     while IFS= read -r line; do
         case "$line" in ""|\#*) continue ;; esac
