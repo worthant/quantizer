@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-14.41
+FOUNDRY_VERSION=2026-08-15.01
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
@@ -117,6 +117,7 @@ hf_put_dir() {
         echo "no token in this shell. export HF_TOKEN, then save_token"
         return 1
     fi
+    scan_secrets "$1" || return 1
     python3 - "$1" "$2" "$3" "$4" << 'PUTDEOF'
 import sys
 from huggingface_hub import HfApi
@@ -270,6 +271,181 @@ UPLOAD        push_base | push_logs | push_results | push_quants | push_model FI
               push_model_split FILE | push_card FILE | send_base user@host PORT
 
 HELP_EOF
+}
+
+
+# ------------------------------------------------------------------ safety
+
+# Anything that looks like a credential must not leave the box. Checked before
+# every upload rather than after: a secret in a public repo is not something a
+# later commit takes back.
+SECRET_RE='hf_[A-Za-z0-9]{30,}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}'
+
+scan_secrets() {
+    local target="${1:-.}" hits
+    hits=$(grep -rlEI "$SECRET_RE" "$target" 2>/dev/null)
+    if [ -n "$hits" ]; then
+        echo
+        echo "!! credential-shaped strings found, refusing to upload:"
+        echo "$hits" | sed "s/^/   /"
+        echo
+        echo "see what matched:"
+        echo "   grep -rnEI '$SECRET_RE' $target | head"
+        return 1
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------ vision
+
+# This model takes images and video, not only text. convert_hf_to_gguf.py
+# writes the language half by default, so a repo without this file is text only
+# however many quants it holds. One file serves the whole ladder and is not
+# worth quantizing at under a gigabyte.
+make_mmproj() {
+    need_preset || return 1
+    if [ ! -d /src ]; then
+        echo "no original weights in /src. Run get_upstream."
+        return 1
+    fi
+    if [ ! -f /src/preprocessor_config.json ]; then
+        echo "no preprocessor_config.json in /src, so this model has no vision"
+        echo "tower and needs no mmproj file."
+        return 1
+    fi
+    if ! python3 /llama.cpp/convert_hf_to_gguf.py --help 2>&1 | grep -q -- "--mmproj"; then
+        echo "this llama.cpp build has no --mmproj flag. Update it."
+        return 1
+    fi
+
+    local stem out t
+    stem=$(basename $MAIN | sed "s/-GGUF$//")
+    for t in f16 bf16; do
+        out=/gguf/mmproj-$stem-$(echo $t | tr a-z A-Z).gguf
+        echo
+        echo "=== $t ==="
+        date
+        python3 /llama.cpp/convert_hf_to_gguf.py /src --mmproj --outtype $t \
+            --outfile $out 2>&1 | tee /logs/mmproj-$t.log
+        ls -lh $out 2>/dev/null
+        autopush /logs/mmproj-$t.log logs/mmproj-$t.log
+    done
+    echo
+    echo "publish with:  push_mmproj"
+}
+
+push_mmproj() {
+    need_preset || return 1
+    local f n
+    for f in /gguf/mmproj-*.gguf; do
+        [ -f "$f" ] || continue
+        n=$(basename "$f")
+        echo "$n  $(du -h "$f" | cut -f1)"
+        hf_put "$f" "$n" "$MAIN" model && echo "  up" || echo "  failed"
+    done
+}
+
+# ------------------------------------------------------------------ checks
+
+# What llama.cpp recorded inside each file. Hugging Face builds its hardware
+# compatibility table from general.file_type, not from the filename, so a build
+# whose rules made it four bit while its declared type says otherwise will not
+# appear in the row users look at.
+check_meta() {
+    python3 - << 'METAEOF'
+import glob, sys
+sys.path.insert(0, "/llama.cpp/gguf-py")
+from gguf import GGUFReader
+
+files = sorted(glob.glob("/gguf/*.gguf"))
+if not files:
+    print("nothing in /gguf")
+    sys.exit(0)
+
+print("%-46s %10s  %s" % ("file", "declared", "template"))
+for p in files:
+    try:
+        r = GGUFReader(p)
+    except Exception as e:
+        print("%-46s  unreadable: %s" % (p.split("/")[-1][:46], str(e)[:40]))
+        continue
+    ft = r.fields.get("general.file_type")
+    ftv = int(ft.parts[ft.data[0]][0]) if ft else None
+    tpl = "yes" if "tokenizer.chat_template" in r.fields else "NO"
+    print("%-46s %10s  %s" % (p.split("/")[-1][:46], ftv, tpl))
+
+print()
+print("file_type numbers: 7 Q8_0, 15 Q4_K_M, 17 Q5_K_M, 18 Q6_K, 30 IQ4_XS,")
+print("26 IQ3_S, 23 IQ3_XXS, 28 IQ2_S, 20 IQ2_XS, 19 IQ2_XXS, 31 IQ1_M")
+print()
+print("A four bit build that declares 7 gets grouped with Q8_0 and vanishes")
+print("from its own row. Set it at quantize time:")
+print("  --override-kv general.file_type=int:15")
+METAEOF
+}
+
+# The corpus was rendered through whichever template was current when we
+# converted. If upstream has changed it since, the calibration no longer
+# matches what the model reads at inference.
+check_template() {
+    need_preset || return 1
+    local mine=/tmp/template-mine.jinja up=/tmp/template-up.jinja f
+    f=$(ls /gguf/*.gguf 2>/dev/null | grep -v -i bf16 | grep -v "/mmproj-" | head -1)
+    if [ -z "$f" ]; then
+        echo "no gguf on this box to read a template from"
+        return 1
+    fi
+    echo "reading from $(basename $f)"
+    python3 - "$f" > $mine << 'TPLEOF'
+import sys
+sys.path.insert(0, "/llama.cpp/gguf-py")
+from gguf import GGUFReader
+r = GGUFReader(sys.argv[1])
+fld = r.fields.get("tokenizer.chat_template")
+if not fld:
+    print("NO TEMPLATE IN THIS FILE")
+    sys.exit(0)
+print(bytes(fld.parts[fld.data[0]]).decode("utf-8"))
+TPLEOF
+
+    rm -rf /tmp/up
+    hf download $UPSTREAM --include "chat_template.jinja" --local-dir /tmp/up > /dev/null 2>&1
+    if [ ! -f /tmp/up/chat_template.jinja ]; then
+        echo "upstream ships no chat_template.jinja; it may live inside"
+        echo "tokenizer_config.json instead. Compare by hand."
+        return 1
+    fi
+    cp /tmp/up/chat_template.jinja $up
+
+    if diff -q $mine $up > /dev/null; then
+        echo "identical to $UPSTREAM"
+    else
+        echo "DIFFERENT from $UPSTREAM. Upstream changed it after we converted,"
+        echo "so the corpus was rendered through the older one."
+        echo
+        diff $mine $up | head -40
+    fi
+}
+
+# One command for a box that has nothing on it.
+newbox() {
+    if [ -z "$2" ]; then
+        echo "newbox SHORTNAME UPSTREAM_REPO [cuda_arch]"
+        echo "  newbox qwen3.8-27b Qwen/Qwen3.8-27B 120"
+        return 1
+    fi
+    check
+    cuda_check
+    setup
+    build "${3:-120}"
+    gpu_test
+    use_model "$1" "$2" || return 1
+    persist_shell
+    echo
+    echo "box ready. Next, depending on what you came for:"
+    echo "  get_upstream ; setup_convert ; make_mmproj ; push_mmproj"
+    echo "  get_quants ; check_meta ; check_template"
+    echo "  get_eval ; base ; kld_all"
 }
 
 # ------------------------------------------------------------------ presets
