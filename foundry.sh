@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-16.01
+FOUNDRY_VERSION=2026-08-16.02
 
 # ------------------------------------------------------------------ settings
 # These live here and nowhere else. An earlier edit lost them, which left BIN,
@@ -508,7 +508,10 @@ test_vision() {
         quant_files | sed "s/^/   /"
         return 1
     fi
-    proj=$(ls /gguf/mmproj-*F16.gguf 2>/dev/null | head -1)
+    # "BF16" contains "F16", so a glob on F16 matches both and sorts BF16
+    # first. Ask for the one that is not BF16 unless MMPROJ says otherwise.
+    proj=${MMPROJ:-$(ls /gguf/mmproj-*.gguf 2>/dev/null | grep -v -i bf16 | head -1)}
+    [ -z "$proj" ] && proj=$(ls /gguf/mmproj-*.gguf 2>/dev/null | head -1)
     if [ -z "$proj" ]; then
         echo "no mmproj on this box. Run make_mmproj, or pull it from the repo."
         return 1
@@ -524,11 +527,100 @@ test_vision() {
     echo "model: $(basename $model)"
     echo "proj : $(basename $proj)"
     echo
+    # llama.cpp warns that this family needs at least 1024 image tokens or
+    # grounding suffers. Pass it rather than ignore the warning.
     stdbuf -oL -eL $BIN/llama-mtmd-cli -m "$model" --mmproj "$proj" \
-        --image /tmp/test.jpg -ngl 99 -c 4096 \
+        --image /tmp/test.jpg -ngl 99 -c 8192 --image-min-tokens 1024 \
         -p "Describe this image in two sentences." \
         2>&1 | tee /logs/vision-$(basename $model .gguf).log
+    autopush /logs/vision-$(basename $model .gguf).log \
+        logs/vision-$(basename $model .gguf).log
 }
+
+# Vision across the ladder. The projector is shared, so what changes from file
+# to file is how much of the image the language half can still use. Low bit
+# builds are where it breaks first, and that is exactly what a reader wants to
+# know before downloading one.
+test_vision_all() {
+    local f n=0 total
+    total=$(quant_files | wc -l)
+    for f in $(quant_files); do
+        n=$(( n + 1 ))
+        echo
+        echo "########## $n of $total ##########"
+        test_vision "$f" | tail -20
+    done
+    echo
+    echo "the full transcripts are in /logs/vision-*.log"
+}
+
+# Does the chat template survive quantization intact. Runs a conversation that
+# uses the constructs the template actually has to render, with --jinja so the
+# model's own template is used rather than a built in guess.
+test_chat() {
+    local model="$1"
+    if [ -z "$model" ]; then
+        echo "test_chat /gguf/<quant>.gguf"
+        return 1
+    fi
+    cat > /tmp/tools.json << 'TOOLSEOF'
+[{"type":"function","function":{
+  "name":"get_weather",
+  "description":"Get the current weather for a city",
+  "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]
+TOOLSEOF
+
+    echo "=== plain turn, thinking channel ==="
+    stdbuf -oL -eL $BIN/llama-cli -m "$model" -ngl 99 -c 8192 --jinja -no-cnv \
+        -p "Think briefly, then answer: what is 17 times 23?" -n 200 \
+        2>&1 | tee /logs/chat-$(basename $model .gguf).log | tail -25
+
+    echo
+    echo "=== tool call ==="
+    stdbuf -oL -eL $BIN/llama-cli -m "$model" -ngl 99 -c 8192 --jinja -no-cnv \
+        --chat-template-file /tmp/none 2>/dev/null || true
+    stdbuf -oL -eL $BIN/llama-cli -m "$model" -ngl 99 -c 8192 --jinja -no-cnv \
+        -p "What is the weather in Paris? Use the tool." -n 200 \
+        2>&1 | tail -25
+
+    echo
+    echo "what to look for: a <think> block that opens and closes, and a"
+    echo "<tool_call> block with valid json inside. Markup that appears as"
+    echo "literal text instead of being emitted as tokens means the template"
+    echo "did not survive."
+    autopush /logs/chat-$(basename $model .gguf).log logs/chat-$(basename $model .gguf).log
+}
+
+# Long context behaves differently from short: rope scaling, cache growth and
+# any attention window only show up past a few thousand tokens.
+test_longctx() {
+    local model="$1" ctx="${2:-32768}"
+    if [ -z "$model" ]; then
+        echo "test_longctx /gguf/<quant>.gguf [context]"
+        return 1
+    fi
+    if [ ! -f $IM_CORPUS ] && [ ! -f $EVAL ]; then
+        echo "no text to feed it. Run get_eval."
+        return 1
+    fi
+    local text=${EVAL}
+    [ -f "$IM_CORPUS" ] && text=$IM_CORPUS
+
+    echo "filling $ctx tokens from $(basename $text), then asking for a summary"
+    head -c $(( ctx * 3 )) "$text" > /tmp/long.txt
+    echo "" >> /tmp/long.txt
+    echo "Summarise the text above in three sentences." >> /tmp/long.txt
+
+    stdbuf -oL -eL $BIN/llama-cli -m "$model" -ngl 99 -c $ctx --jinja -no-cnv \
+        -f /tmp/long.txt -n 300 \
+        2>&1 | tee /logs/longctx-$(basename $model .gguf).log | tail -30
+
+    echo
+    grep -E "n_ctx|rope|kv cache|KV self|eval time" /logs/longctx-$(basename $model .gguf).log | head -20
+    autopush /logs/longctx-$(basename $model .gguf).log \
+        logs/longctx-$(basename $model .gguf).log
+}
+
 
 # ------------------------------------------------------------------ renaming
 
