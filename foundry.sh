@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-16.02
+FOUNDRY_VERSION=2026-08-16.05
 
 # ------------------------------------------------------------------ settings
 # These live here and nowhere else. An earlier edit lost them, which left BIN,
@@ -500,8 +500,13 @@ newbox() {
 
 # Does the vision tower actually work with our quants. Downloads a small test
 # image, runs one quant with the projector, and prints what the model saw.
+# test_vision MODEL [IMAGE] [PROMPT]
+# A picture with text on it is the better test: a description of a diagram is
+# hard to score, but a misread word is obvious. That makes it possible to say
+# where on the ladder vision stops being reliable, rather than only that it
+# works somewhere.
 test_vision() {
-    local model="$1" proj
+    local model="$1" img="${2:-}" prompt="${3:-}" proj
     if [ -z "$model" ]; then
         echo "test_vision /gguf/<quant>.gguf"
         echo "available:"
@@ -520,19 +525,33 @@ test_vision() {
         echo "llama-mtmd-cli is not built. Rebuild with the current build function."
         return 1
     fi
-    if [ ! -f /tmp/test.jpg ]; then
-        curl -sL "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/ai2d-demo.jpg" \
-            -o /tmp/test.jpg || { echo "could not fetch a test image"; return 1; }
+    if [ -z "$img" ]; then
+        img=/tmp/test.jpg
+        if [ ! -f "$img" ]; then
+            curl -sL "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/ai2d-demo.jpg" \
+                -o "$img" || { echo "could not fetch a test image"; return 1; }
+        fi
     fi
+    if [ ! -f "$img" ]; then
+        echo "no such image: $img"
+        return 1
+    fi
+    [ -z "$prompt" ] && prompt="Describe this image in two sentences."
     echo "model: $(basename $model)"
     echo "proj : $(basename $proj)"
+    echo "image: $img"
     echo
     # llama.cpp warns that this family needs at least 1024 image tokens or
     # grounding suffers. Pass it rather than ignore the warning.
+    # Two known sources of noise are filtered from what you see, not from the
+    # log: unused tensor lines are the MTP head the plain graph never runs, and
+    # find_slot lines are how this family numbers image patches. Real errors
+    # still come through.
     stdbuf -oL -eL $BIN/llama-mtmd-cli -m "$model" --mmproj "$proj" \
-        --image /tmp/test.jpg -ngl 99 -c 8192 --image-min-tokens 1024 \
-        -p "Describe this image in two sentences." \
-        2>&1 | tee /logs/vision-$(basename $model .gguf).log
+        --image "$img" -ngl 99 -c 8192 --image-min-tokens 1024 \
+        -p "$prompt" \
+        2>&1 | tee /logs/vision-$(basename $model .gguf).log \
+        | grep -vE "unused tensor|find_slot|does not match expectation"
     autopush /logs/vision-$(basename $model .gguf).log \
         logs/vision-$(basename $model .gguf).log
 }
@@ -541,54 +560,71 @@ test_vision() {
 # to file is how much of the image the language half can still use. Low bit
 # builds are where it breaks first, and that is exactly what a reader wants to
 # know before downloading one.
+# test_vision_all [IMAGE] [PROMPT]
 test_vision_all() {
-    local f n=0 total
+    local f n=0 total img="${1:-}" prompt="${2:-}"
     total=$(quant_files | wc -l)
     for f in $(quant_files); do
         n=$(( n + 1 ))
         echo
         echo "########## $n of $total ##########"
-        test_vision "$f" | tail -20
+        test_vision "$f" "$img" "$prompt" | tail -25
     done
     echo
     echo "the full transcripts are in /logs/vision-*.log"
 }
 
-# Does the chat template survive quantization intact. Runs a conversation that
-# uses the constructs the template actually has to render, with --jinja so the
-# model's own template is used rather than a built in guess.
+# Does the chat template survive quantization intact. --jinja makes llama.cpp
+# use the template stored in the file rather than a built in guess, which is
+# the whole point: it tests what a user will actually get.
 test_chat() {
     local model="$1"
     if [ -z "$model" ]; then
         echo "test_chat /gguf/<quant>.gguf"
         return 1
     fi
-    cat > /tmp/tools.json << 'TOOLSEOF'
-[{"type":"function","function":{
-  "name":"get_weather",
-  "description":"Get the current weather for a city",
-  "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]
-TOOLSEOF
-
-    echo "=== plain turn, thinking channel ==="
     stdbuf -oL -eL $BIN/llama-cli -m "$model" -ngl 99 -c 8192 --jinja -no-cnv \
-        -p "Think briefly, then answer: what is 17 times 23?" -n 200 \
-        2>&1 | tee /logs/chat-$(basename $model .gguf).log | tail -25
+        -p "Think briefly, then answer: what is 17 times 23?" -n 400 \
+        2>&1 | tee /logs/chat-$(basename $model .gguf).log | tail -30
 
     echo
-    echo "=== tool call ==="
-    stdbuf -oL -eL $BIN/llama-cli -m "$model" -ngl 99 -c 8192 --jinja -no-cnv \
-        --chat-template-file /tmp/none 2>/dev/null || true
-    stdbuf -oL -eL $BIN/llama-cli -m "$model" -ngl 99 -c 8192 --jinja -no-cnv \
-        -p "What is the weather in Paris? Use the tool." -n 200 \
-        2>&1 | tail -25
-
-    echo
-    echo "what to look for: a <think> block that opens and closes, and a"
-    echo "<tool_call> block with valid json inside. Markup that appears as"
-    echo "literal text instead of being emitted as tokens means the template"
-    echo "did not survive."
+    echo "what to look for: a thinking block that opens and closes, a correct"
+    echo "answer after it, and no template markup showing up as literal text."
+    echo "Tool calling is a server feature, not a cli one: run test_tools."
     autopush /logs/chat-$(basename $model .gguf).log logs/chat-$(basename $model .gguf).log
+}
+
+# Tool calling needs the server, because the cli has nowhere to put a function
+# list. Two panes rather than a background process, so you can watch both.
+test_tools() {
+    local model="${1:-}"
+    if [ -z "$model" ]; then
+        echo "test_tools /gguf/<quant>.gguf"
+        return 1
+    fi
+    cat << TOOLSEOF
+
+In one pane:
+
+  $BIN/llama-server -m $model -ngl 99 -c 8192 --jinja --port 8080
+
+In another:
+
+  curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+    "messages": [{"role":"user","content":"What is the weather in Paris?"}],
+    "tools": [{"type":"function","function":{
+      "name":"get_weather",
+      "description":"Get the current weather for a city",
+      "parameters":{"type":"object","properties":{"city":{"type":"string"}},
+                    "required":["city"]}}}],
+    "tool_choice": "auto"
+  }' | python3 -m json.tool | tee /logs/tools-$(basename $model .gguf).json
+
+A pass looks like a tool_calls array with get_weather and a parsed arguments
+object. A fail looks like the model writing the call as plain text in content,
+which means llama.cpp did not recognise the template's tool syntax.
+
+TOOLSEOF
 }
 
 # Long context behaves differently from short: rope scaling, cache growth and
@@ -607,18 +643,58 @@ test_longctx() {
     [ -f "$IM_CORPUS" ] && text=$IM_CORPUS
 
     echo "filling $ctx tokens from $(basename $text), then asking for a summary"
+    echo "this tests that the model can attend across the whole window and that"
+    echo "rope scaling holds. It does not test long range reasoning: the corpus"
+    echo "is unrelated passages, so there is nothing far apart to connect."
     head -c $(( ctx * 3 )) "$text" > /tmp/long.txt
     echo "" >> /tmp/long.txt
     echo "Summarise the text above in three sentences." >> /tmp/long.txt
 
     stdbuf -oL -eL $BIN/llama-cli -m "$model" -ngl 99 -c $ctx --jinja -no-cnv \
-        -f /tmp/long.txt -n 300 \
+        -f /tmp/long.txt -n 800 \
         2>&1 | tee /logs/longctx-$(basename $model .gguf).log | tail -30
 
     echo
     grep -E "n_ctx|rope|kv cache|KV self|eval time" /logs/longctx-$(basename $model .gguf).log | head -20
     autopush /logs/longctx-$(basename $model .gguf).log \
         logs/longctx-$(basename $model .gguf).log
+}
+
+
+# A demo image in the repo lets anyone reproduce the vision example without
+# hunting for a picture, and lets us show a screenshot people can check.
+#
+# Use something whose licence you know. The image test_vision downloads comes
+# from someone else's repository and is fine for a local check, but it is not
+# ours to redistribute.
+push_demo_image() {
+    local f="$1" src="${2:-}"
+    if [ -z "$f" ] || [ ! -f "$f" ]; then
+        echo "push_demo_image FILE [SOURCE_NOTE]"
+        echo "  push_demo_image /root/shot.png 'Atomic Chat UI, our own screenshot'"
+        return 1
+    fi
+    need_preset || return 1
+    token_check > /dev/null || return 1
+
+    local ext name
+    ext="${f##*.}"
+    name="demo.$ext"
+    hf_put "$f" "$name" "$MAIN" model || return 1
+
+    if [ -n "$src" ]; then
+        printf '%s\n' "$name: $src" > /tmp/demo-source.txt
+        hf_put /tmp/demo-source.txt "demo-source.txt" "$MAIN" model
+    else
+        echo
+        echo "no source note given. Add one so nobody has to guess where the"
+        echo "image came from:  push_demo_image $f 'where it is from'"
+    fi
+    echo
+    echo "people can now run:"
+    echo "  hf download $MAIN --include '$name' --local-dir ."
+    echo "  llama-mtmd-cli -m <quant>.gguf --mmproj mmproj-*-F16.gguf \\"
+    echo "    --image $name --image-min-tokens 1024 -ngl 99 -c 8192"
 }
 
 
