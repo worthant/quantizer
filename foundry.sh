@@ -10,10 +10,56 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-15.01
+FOUNDRY_VERSION=2026-08-16.01
+
+# ------------------------------------------------------------------ settings
+# These live here and nowhere else. An earlier edit lost them, which left BIN,
+# STATE and CTX empty: status reported a build that existed as missing, and
+# save_state wrote to an empty path.
+BIN=/llama.cpp/build/bin
+STATE=/state.sh
+CTX=4096
+
+EVALSET=${EVALSET:-neutral}
+EVAL=${EVAL:-/eval/neutral.txt}
+BASE=${BASE:-/kld/base-neutral.kld}
+
+IM_CTX=${IM_CTX:-512}
+IM_BATCH=${IM_BATCH:-4096}
+IM_CORPUS=${IM_CORPUS:-/eval/calib_train.txt}
+IM_NO_PPL=${IM_NO_PPL:-0}
+IM_OFREQ=${IM_OFREQ:-20}
+MTP_TYPE=${MTP_TYPE:-q5_k}
+AUTOPUSH=${AUTOPUSH:-1}
+GPUS=${GPUS:-all}
+INCLUDE_EXPERIMENTAL=${INCLUDE_EXPERIMENTAL:-0}
 
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=/hf
+
+# The container gets its environment from the server template, but an ssh
+# login shell does not inherit it: PID 1 has it and we do not. Reading it back
+# out of /proc/1/environ is the only way to see what the template actually set,
+# and it is why HF_TOKEN kept looking absent in every new pane.
+load_env() {
+    local v
+    for v in HF_TOKEN HF_XET_HIGH_PERFORMANCE HF_HOME; do
+        if [ -z "${!v}" ] && [ -r /proc/1/environ ]; then
+            local val
+            val=$(tr '\0' '\n' < /proc/1/environ | grep "^$v=" | head -1 | cut -d= -f2-)
+            [ -n "$val" ] && export "$v=$val"
+        fi
+    done
+    if [ -n "$HF_TOKEN" ]; then
+        echo "HF_TOKEN present (${#HF_TOKEN} chars)"
+    else
+        echo "no HF_TOKEN anywhere, not in this shell and not in the container"
+        echo "environment. Set it in the template, or export it here."
+        return 1
+    fi
+}
+
+load_env > /dev/null 2>&1
 
 # Both http paths to github are cached: raw.githubusercontent behind a CDN, and
 # the contents API behind its own layer. Either can serve a file that is minutes
@@ -176,6 +222,7 @@ quant_files() {
         | grep -v -i "bf16" \
         | grep -v "/dflash-" \
         | grep -v "/dspark-" \
+        | grep -v "/mmproj-" \
         | grep -v -i "imatrix" \
         | { [ -n "$stem" ] && grep -F "$stem" || cat; } \
         | sort
@@ -417,7 +464,8 @@ TPLEOF
     fi
     cp /tmp/up/chat_template.jinja $up
 
-    if diff -q $mine $up > /dev/null; then
+    # A missing newline at end of file is not a difference in the template.
+    if diff -q <(sed -e '$a\' $mine) <(sed -e '$a\' $up) > /dev/null; then
         echo "identical to $UPSTREAM"
     else
         echo "DIFFERENT from $UPSTREAM. Upstream changed it after we converted,"
@@ -447,6 +495,117 @@ newbox() {
     echo "  get_quants ; check_meta ; check_template"
     echo "  get_eval ; base ; kld_all"
 }
+
+# ------------------------------------------------------------------ vision test
+
+# Does the vision tower actually work with our quants. Downloads a small test
+# image, runs one quant with the projector, and prints what the model saw.
+test_vision() {
+    local model="$1" proj
+    if [ -z "$model" ]; then
+        echo "test_vision /gguf/<quant>.gguf"
+        echo "available:"
+        quant_files | sed "s/^/   /"
+        return 1
+    fi
+    proj=$(ls /gguf/mmproj-*F16.gguf 2>/dev/null | head -1)
+    if [ -z "$proj" ]; then
+        echo "no mmproj on this box. Run make_mmproj, or pull it from the repo."
+        return 1
+    fi
+    if [ ! -x $BIN/llama-mtmd-cli ]; then
+        echo "llama-mtmd-cli is not built. Rebuild with the current build function."
+        return 1
+    fi
+    if [ ! -f /tmp/test.jpg ]; then
+        curl -sL "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/ai2d-demo.jpg" \
+            -o /tmp/test.jpg || { echo "could not fetch a test image"; return 1; }
+    fi
+    echo "model: $(basename $model)"
+    echo "proj : $(basename $proj)"
+    echo
+    stdbuf -oL -eL $BIN/llama-mtmd-cli -m "$model" --mmproj "$proj" \
+        --image /tmp/test.jpg -ngl 99 -c 4096 \
+        -p "Describe this image in two sentences." \
+        2>&1 | tee /logs/vision-$(basename $model .gguf).log
+}
+
+# ------------------------------------------------------------------ renaming
+
+# Rename a published file and move the metrics log with it, so a build never
+# ends up with results filed under a name that no longer exists.
+rename_quant() {
+    if [ -z "$2" ]; then
+        echo "rename_quant OLD NEW      names without .gguf"
+        echo "  rename_quant Qwen3.8-27B-AD-Q4_K Qwen3.8-27B-AD-Q4_K_M"
+        return 1
+    fi
+    need_preset || return 1
+    token_check > /dev/null || return 1
+    local old="$1" new="$2"
+
+    if [ -f "/gguf/$old.gguf" ]; then
+        mv "/gguf/$old.gguf" "/gguf/$new.gguf"
+        echo "renamed on disk"
+    fi
+    if [ ! -f "/gguf/$new.gguf" ]; then
+        echo "no /gguf/$new.gguf to upload"
+        return 1
+    fi
+
+    echo "uploading $new.gguf  $(du -h /gguf/$new.gguf | cut -f1)"
+    hf_put "/gguf/$new.gguf" "$new.gguf" "$MAIN" model || return 1
+    del_model "$old"
+
+    local ol="/logs/kld-$EVALSET--$old.log" nl="/logs/kld-$EVALSET--$new.log"
+    if [ -f "$ol" ]; then
+        mv "$ol" "$nl"
+        autopush "$nl" "logs/kld-$EVALSET--$new.log"
+        python3 - "$METRICS" "$METRICS_KIND" "logs/kld-$EVALSET--$old.log" << 'DELLOGEOF'
+import sys
+from huggingface_hub import HfApi
+try:
+    HfApi().delete_file(path_in_repo=sys.argv[3], repo_id=sys.argv[1], repo_type=sys.argv[2])
+    print("  old log removed from the metrics repo")
+except Exception as e:
+    print("  old log not removed: %s" % str(e).splitlines()[0])
+DELLOGEOF
+    fi
+}
+
+# ------------------------------------------------------------------ scrollback
+
+# tmux keeps very little history by default and scrolling it needs a key
+# sequence. This makes the wheel work and the buffer deep, once per box.
+fix_tmux() {
+    cat > ~/.tmux.conf << 'TMUXEOF'
+set -g mouse on
+set -g history-limit 200000
+set -g status-interval 5
+setw -g mode-keys vi
+TMUXEOF
+    tmux source-file ~/.tmux.conf 2>/dev/null
+    echo "mouse scrolling on, 200k lines of history."
+    echo "search inside the buffer: ctrl-b [ then / and a pattern."
+}
+
+# Open the newest log, or a named one, in a pager you can search.
+lastlog() {
+    local f
+    if [ -n "$1" ]; then
+        f=$(ls -t /logs/*"$1"* 2>/dev/null | head -1)
+    else
+        f=$(ls -t /logs/* 2>/dev/null | head -1)
+    fi
+    if [ -z "$f" ]; then
+        echo "no log matches"
+        ls /logs | sed "s/^/   /"
+        return 1
+    fi
+    echo "$f"
+    less -R "$f"
+}
+
 
 # ------------------------------------------------------------------ presets
 
@@ -564,7 +723,19 @@ status() {
     mark "llama.cpp built"    $BIN/llama-imatrix         "build 120"
     mark "eval corpus"        $EVAL                      "get_eval"
 
-    if find /gguf -name "*.gguf" 2>/dev/null | grep -qi bf16; then
+    if [ -d /src ] && ls /src/*.safetensors > /dev/null 2>&1; then
+        echo "  [x] original weights in /src  ($(du -sh /src 2>/dev/null | cut -f1))"
+    else
+        echo "  [ ] original weights in /src  ->  run:  get_upstream"
+    fi
+
+    if ls /gguf/mmproj-*.gguf > /dev/null 2>&1; then
+        echo "  [x] mmproj on disk: $(ls /gguf/mmproj-*.gguf | wc -l) files"
+    elif [ -f /src/preprocessor_config.json ]; then
+        echo "  [ ] mmproj missing      ->  run:  make_mmproj   (this model sees images)"
+    fi
+
+    if find /gguf -name "*.gguf" 2>/dev/null | grep -v "/mmproj-" | grep -qi bf16; then
         echo "  [x] bf16 on disk"
     else
         echo "  [ ] bf16 on disk       ->  run:  get_bf16, or make_bf16 for a new model"
@@ -946,7 +1117,7 @@ build() {
         -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$1
     cmake --build build -j $(nproc) --target \
         llama-perplexity llama-bench llama-cli llama-gguf-split \
-        llama-imatrix llama-quantize
+        llama-imatrix llama-quantize llama-mtmd-cli
 
     ls -la $BIN/
     echo
