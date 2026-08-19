@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-16.05
+FOUNDRY_VERSION=2026-08-19.01
 
 # ------------------------------------------------------------------ settings
 # These live here and nowhere else. An earlier edit lost them, which left BIN,
@@ -1472,6 +1472,11 @@ get_upstream() {
     ls /src
 }
 
+# The target file, always without the MTP head. A head inside the main file is
+# never executed by a plain forward pass, so it only adds weight and forces
+# quantize to special case it. And when the config promises a head the weights
+# do not have, the converter writes a block count it cannot fill: the export
+# succeeds and the file refuses to load.
 make_bf16() {
     need_preset || return 1
     if [ ! -d /src ]; then
@@ -1482,16 +1487,39 @@ make_bf16() {
         echo "llama.cpp not cloned. Run build first."
         return 1
     fi
-    BF16_OUT=/gguf/$(basename $MAIN | sed "s/-GGUF//")-bf16.gguf
+    BF16_OUT=/gguf/$(basename $MAIN | sed "s/-GGUF//")-BF16.gguf
     echo "converting /src -> $BF16_OUT"
     echo "If it fails with NaN in token_embd, add --no-lazy and rerun."
     date
-    python3 /llama.cpp/convert_hf_to_gguf.py /src --outtype bf16 --outfile $BF16_OUT \
-        2>&1 | tee /logs/convert.log
+    python3 /llama.cpp/convert_hf_to_gguf.py /src --outtype bf16 --no-nextn \
+        --outfile $BF16_OUT 2>&1 | tee /logs/convert.log
     date
     ls -lh $BF16_OUT
     echo
-    echo "Publish it with push_model_split so it clears the 50 GB per-file limit."
+    echo "Now:  check_blocks $BF16_OUT"
+}
+
+# The speculative draft as its own file. Only possible when the weights carry
+# the head. The config is not evidence: Ornith-1.5-9B claims one and ships none.
+make_bf16_mtp() {
+    need_preset || return 1
+    if [ ! -f /src/model.safetensors.index.json ]; then
+        echo "no weight index in /src. Run get_upstream."
+        return 1
+    fi
+    if ! grep -qi -e nextn -e mtp /src/model.safetensors.index.json; then
+        echo "no MTP tensors in these weights, nothing to export."
+        return 1
+    fi
+    MTP_OUT=/gguf/mtp-$(basename $MAIN | sed "s/-GGUF//")-BF16.gguf
+    echo "converting the MTP head only -> $MTP_OUT"
+    date
+    python3 /llama.cpp/convert_hf_to_gguf.py /src --outtype bf16 --mtp \
+        --outfile $MTP_OUT 2>&1 | tee /logs/convert-mtp.log
+    date
+    ls -lh $MTP_OUT
+    echo
+    echo "serve it with:  --spec-type draft-mtp --spec-draft-n-max 6"
 }
 
 
