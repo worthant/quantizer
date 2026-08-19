@@ -394,6 +394,47 @@ push_mmproj() {
 
 # ------------------------------------------------------------------ checks
 
+# What the file says about itself against what it actually holds. Cheap, and
+# it catches the whole class of bug where metadata and tensors disagree.
+check_blocks() {
+    local f="${1:-}"
+    if [ -z "$f" ]; then
+        find_bf16 || return 1
+        f=$BF16_FIRST
+    fi
+    python3 - "$f" << 'BLKEOF'
+import re, sys
+sys.path.insert(0, "/llama.cpp/gguf-py")
+from gguf import GGUFReader
+r = GGUFReader(sys.argv[1])
+
+def s(key):
+    fld = r.fields.get(key)
+    return bytes(fld.parts[fld.data[0]]).decode() if fld else None
+
+def i(key):
+    fld = r.fields.get(key)
+    return int(fld.parts[fld.data[0]][0]) if fld else None
+
+arch = s("general.architecture")
+declared = i("%s.block_count" % arch) if arch else None
+seen = {int(m.group(1)) for t in r.tensors
+        for m in [re.match(r"blk\.(\d+)\.", t.name)] if m}
+actual = max(seen) + 1 if seen else 0
+
+print("architecture : %s" % arch)
+print("declared     : %s blocks" % declared)
+print("present      : %d blocks, blk.0 to blk.%d" % (len(seen), actual - 1))
+if declared is not None and declared != actual:
+    print()
+    print("MISMATCH. llama.cpp will ask for blk.%d and there is nothing" % actual)
+    print("there, so this file will not load. If the extra block is an MTP")
+    print("head the weights never shipped, reconvert with --no-nextn.")
+    sys.exit(1)
+print("ok, they agree")
+BLKEOF
+}
+
 # What llama.cpp recorded inside each file. Hugging Face builds its hardware
 # compatibility table from general.file_type, not from the filename, so a build
 # whose rules made it four bit while its declared type says otherwise will not
