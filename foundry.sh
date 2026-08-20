@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-19.01
+FOUNDRY_VERSION=2026-08-20.01
 
 # ------------------------------------------------------------------ settings
 # These live here and nowhere else. An earlier edit lost them, which left BIN,
@@ -179,26 +179,19 @@ PUTDEOF
 
 # Never guess a repo id.
 find_repo() {
-    if [ -z "$1" ]; then
-        echo "find_repo QUERY        e.g. find_repo Qwen3.8"
-        return 1
-    fi
+    [ -z "$1" ] && { echo "find_repo QUERY"; return 1; }
     python3 - "$1" << 'FINDEOF'
 import sys
 from huggingface_hub import HfApi
-q = sys.argv[1]
+api = HfApi()
 try:
-    hits = list(HfApi().list_models(search=q, sort="downloads", direction=-1, limit=40))
-except Exception as e:
-    print("search failed: %s" % e)
-    sys.exit(1)
+    hits = list(api.list_models(search=sys.argv[1], sort="downloads", limit=40))
+except TypeError:
+    hits = list(api.list_models(search=sys.argv[1], limit=40))
 if not hits:
-    print("nothing on the hub matches %r" % q)
-    sys.exit(1)
-print("%-52s %12s  %s" % ("repo id", "downloads", "updated"))
+    print("nothing matches %r" % sys.argv[1]); sys.exit(1)
 for m in hits:
-    print("%-52s %12s  %s" % (m.id, m.downloads or 0,
-                              str(getattr(m, "lastModified", ""))[:10]))
+    print("%-54s %10s" % (m.id, m.downloads or 0))
 FINDEOF
 }
 
@@ -3991,6 +3984,1213 @@ run_quant_box() {
     push_results
 }
 
+# ================================================================== MLX
+#
+# The MLX side of the pipeline. Same rules as everything above: one function
+# at a time, in the foreground, nothing hidden in the background.
+#
+# Read this once, it saves an afternoon:
+#
+#   A GGUF quant is a file. An MLX quant is a whole checkpoint directory:
+#   config.json + sharded safetensors + tokenizer. The loader takes the
+#   directory or the repo id, not a file inside it. That is why every rung of
+#   the ladder needs its own repository on the hub.
+#
+#   mlx_vlm.convert is the primary tool here, not mlx_lm.convert. It is the
+#   one that keeps the vision tower, and its output is what the desktop app
+#   loads directly. Reach for mlx-lm only for a method that mlx-vlm does not
+#   have, and run mlx_caps to find out which those are on THIS box rather
+#   than trusting anyone's list, this file included.
+#
+#   The method used to pick the numbers leaves no trace in the output. Plain
+#   rounding, awq, gptq, distillation and per layer allocation all write the
+#   same affine quantized checkpoint. Nothing downstream needs to know which
+#   was used. That is why a checkpoint made by an mlx-lm command can be loaded
+#   by mlx-vlm once the directory has the shape mlx-vlm expects, which is what
+#   mlx_reattach is for.
+#
+#   One bit is a special case worth knowing about. mlx-vlm can RUN a one bit
+#   affine checkpoint: bits: 1 in the config, packed uint32 weights, scales
+#   and biases, group size 32, 64 or 128. Nothing in the stack PRODUCES one.
+#   See mlx_1bit_status.
+
+MLXROOT=${MLXROOT:-/mlx}
+MLX_SRC=${MLX_SRC:-/src}
+MLX_EVAL=${MLX_EVAL:-/eval/neutral.txt}
+MLX_CTX=${MLX_CTX:-512}
+MLX_STEP=${MLX_STEP:-64}
+MLX_REF=${MLX_REF:-}
+MLX_GROUP=${MLX_GROUP:-64}
+MLX_BACKEND=${MLX_BACKEND:-cuda13}
+MLX_SENS=${MLX_SENS:-/mlx/sensitivities.json}
+
+
+# ------------------------------------------------------------------ setup
+
+# MLX_BACKEND picks the wheel: cuda13 for an Nvidia box on CUDA 13, cuda12 for
+# CUDA 12, cpu for a machine with no GPU at all. Plain conversion works on cpu,
+# measurement and distillation do not.
+mlx_setup() {
+    echo "backend  : $MLX_BACKEND"
+    echo "installs : mlx, mlx-vlm with the training extra, mlx-lm with it too"
+    echo
+    echo "the training extra brings the optimizer and autograd pieces. Without"
+    echo "it the learned quantization entry points import-error even when they"
+    echo "are present in the package."
+    echo
+    case "$MLX_BACKEND" in
+        cuda13) echo "CUDA 13 wheel, needs an Nvidia driver 580 or newer:" ;;
+        cuda12) echo "CUDA 12 wheel." ;;
+        cpu)    echo "CPU only. Conversion works, everything else crawls." ;;
+        *) echo "unknown MLX_BACKEND: $MLX_BACKEND (cuda13, cuda12 or cpu)"
+           return 1 ;;
+    esac
+    nvidia-smi --query-gpu=name,driver_version --format=csv 2>/dev/null
+    echo
+    ask "install?" || return 1
+
+    pip install --break-system-packages -q -U "mlx[$MLX_BACKEND]" || return 1
+    pip install --break-system-packages -q -U "mlx-vlm[train]" || return 1
+    pip install --break-system-packages -q -U "mlx-lm[train]" || return 1
+    mkdir -p $MLXROOT /logs
+
+    echo
+    mlx_check
+    echo
+    echo "now run mlx_caps. Do not skip it: it is the only thing that says"
+    echo "what these versions actually give you."
+}
+
+mlx_check() {
+    python3 - << 'MLXCHKEOF' | tee /logs/mlx-env.txt
+import importlib, sys, time
+
+def ver(name):
+    try:
+        return importlib.import_module(name).__version__
+    except Exception as e:
+        return "NOT INSTALLED (%s)" % str(e).splitlines()[0][:50]
+
+print("mlx      :", ver("mlx"))
+print("mlx_vlm  :", ver("mlx_vlm"))
+print("mlx_lm   :", ver("mlx_lm"))
+
+try:
+    import mlx.core as mx
+except Exception as e:
+    print("mlx does not import at all:", e)
+    sys.exit(1)
+
+print("device   :", mx.default_device())
+
+a = mx.random.normal((2048, 2048))
+mx.eval(a)
+t = time.time()
+for _ in range(10):
+    b = a @ a
+mx.eval(b)
+dt = time.time() - t
+gflops = 10 * 2 * 2048 ** 3 / dt / 1e9
+print("matmul   : %.0f GFLOP/s over ten 2048x2048 runs" % gflops)
+if gflops < 200:
+    print()
+    print("that is processor speed, not GPU speed. Either the cpu wheel got")
+    print("installed or the CUDA backend did not pick up the card.")
+MLXCHKEOF
+    echo
+    echo "written to /logs/mlx-env.txt. Every published number should carry"
+    echo "these versions. The flags on these tools move between releases."
+}
+
+# What the INSTALLED packages actually expose. Written because a blog post from
+# two months ago said mlx-vlm has no learned quantization, its README says the
+# converter does awq, and neither is evidence about the version on this disk.
+# Nothing in this file should be planned around a claim this function has not
+# confirmed.
+mlx_caps() {
+    mkdir -p /logs/mlx-help
+    echo "=============== console entry points ==============="
+    local c
+    for c in mlx_vlm.convert mlx_vlm.generate mlx_vlm.server \
+             mlx_lm.convert mlx_lm.dwq mlx_lm.awq mlx_lm.gptq \
+             mlx_lm.dynamic_quant mlx_lm.evaluate mlx_lm.perplexity \
+             mlx_lm.upload; do
+        if command -v $c > /dev/null 2>&1; then
+            echo "  [x] $c"
+        else
+            echo "  [ ] $c"
+        fi
+    done
+
+    echo
+    echo "=============== inside the mlx-vlm package ==============="
+    python3 - << 'CAPSEOF'
+import os, re, sys
+
+try:
+    import mlx_vlm
+except Exception as e:
+    print("mlx_vlm does not import:", e)
+    sys.exit(0)
+
+root = os.path.dirname(mlx_vlm.__file__)
+print("package at", root)
+
+wanted = ["awq", "dwq", "gptq", "dynamic_quant", "quant_predicate",
+          "QUANT_RECIPES", "skip_multimodal", "skip_vision", "turboquant"]
+hits = {w: [] for w in wanted}
+for dirpath, _, files in os.walk(root):
+    if "tests" in dirpath:
+        continue
+    for f in files:
+        if not f.endswith(".py"):
+            continue
+        p = os.path.join(dirpath, f)
+        try:
+            src = open(p, encoding="utf-8", errors="replace").read()
+        except Exception:
+            continue
+        for w in wanted:
+            if re.search(r"\b%s\b" % re.escape(w), src, re.IGNORECASE):
+                hits[w].append(os.path.relpath(p, root))
+
+for w in wanted:
+    n = len(hits[w])
+    mark = "[x]" if n else "[ ]"
+    where = hits[w][0] if n else ""
+    extra = (" and %d more" % (n - 1)) if n > 1 else ""
+    print("  %s %-16s %s%s" % (mark, w, where, extra))
+
+print()
+print("a name here means the string is in the source, not that a working")
+print("command exists. The converter help below is the real test.")
+CAPSEOF
+
+    echo
+    echo "=============== mlx_vlm.convert options ==============="
+    if command -v mlx_vlm.convert > /dev/null 2>&1; then
+        mlx_vlm.convert --help > /logs/mlx-help/mlx_vlm.convert.txt 2>&1
+        grep -E "^[[:space:]]+-" /logs/mlx-help/mlx_vlm.convert.txt
+    else
+        echo "not installed"
+    fi
+
+    echo
+    echo "=============== mlx_lm entry points ==============="
+    for c in mlx_lm.convert mlx_lm.dwq mlx_lm.awq mlx_lm.gptq mlx_lm.dynamic_quant; do
+        if command -v $c > /dev/null 2>&1; then
+            $c --help > /logs/mlx-help/$c.txt 2>&1
+            echo "--- $c ---"
+            grep -E "^[[:space:]]+--" /logs/mlx-help/$c.txt | head -12
+        fi
+    done
+
+    echo
+    echo "full help pages in /logs/mlx-help/"
+    echo
+    echo "three things to read out of the above before anything long starts:"
+    echo "  1. does mlx_vlm.convert take an awq option, and a dwq or gptq one"
+    echo "  2. what the bits and group flags are called here"
+    echo "     (--q-bits or --bits, --q-group-size or --group-size)"
+    echo "  3. what --skip-vision does in THIS version: leave the tower"
+    echo "     unquantized, or drop it from the output entirely"
+    echo
+    echo "whatever mlx_vlm.convert can do, do THERE. The tower survives and"
+    echo "the result loads in the app with nothing reassembled."
+}
+
+# One bit is loadable but not producible. This says where that stands on the
+# installed versions, because if it ever changes it changes here first.
+mlx_1bit_status() {
+    echo "=============== loading a one bit checkpoint ==============="
+    python3 - << 'ONEBITEOF'
+import os, re, sys
+try:
+    import mlx_vlm
+except Exception as e:
+    print("  mlx_vlm does not import:", e)
+    sys.exit(0)
+root = os.path.dirname(mlx_vlm.__file__)
+found = []
+for dirpath, _, files in os.walk(root):
+    for f in files:
+        if not f.endswith(".py"):
+            continue
+        p = os.path.join(dirpath, f)
+        src = open(p, encoding="utf-8", errors="replace").read()
+        if re.search(r"bits\s*==\s*1\b|one_?bit|1-?bit", src, re.IGNORECASE):
+            found.append(os.path.relpath(p, root))
+if found:
+    print("  supported, the handling lives in:")
+    for f in found[:6]:
+        print("   ", f)
+else:
+    print("  no one bit handling found in this version")
+ONEBITEOF
+
+    echo
+    echo "=============== producing one ==============="
+    python3 - << 'ONEBITQEOF'
+import mlx.core as mx
+w = mx.random.normal((256, 512))
+for b in (1, 2, 3, 4, 5, 6, 8):
+    try:
+        mx.quantize(w, group_size=64, bits=b)
+        print("  bits=%d  ok" % b)
+    except Exception as e:
+        print("  bits=%d  refused: %s" % (b, str(e).splitlines()[0][:60]))
+ONEBITQEOF
+
+    echo
+    echo "If loading works and producing does not, that gap is the most useful"
+    echo "thing on this board. The runtime is already waiting and the contract"
+    echo "is written down: packed uint32 weights, scales and biases, group"
+    echo "size 32, 64 or 128, and bits: 1 declared in config.json."
+}
+
+
+# ------------------------------------------------------------------ naming
+
+mlx_stem() {
+    [ -n "$UPSTREAM" ] && basename "$UPSTREAM"
+}
+
+mlx_out() {
+    echo "$MLXROOT/$(mlx_stem)-MLX-$1"
+}
+
+mlx_repo() {
+    echo "AtomicChat/$(mlx_stem)-MLX-$1"
+}
+
+mlx_metrics_repo() {
+    echo "AtomicChat/$(mlx_stem)-MLX-metrics"
+}
+
+mlx_need() {
+    if [ -z "$UPSTREAM" ]; then
+        echo "no preset loaded. Run use_model NAME REPO first."
+        return 1
+    fi
+    if ! command -v mlx_vlm.convert > /dev/null 2>&1; then
+        echo "mlx-vlm is not installed. Run mlx_setup."
+        return 1
+    fi
+}
+
+
+# ------------------------------------------------------------------ day zero
+
+# mlx_probe SMALL_REPO
+#
+# Run this before renting anything big. It answers two questions the rest of
+# the file depends on: does mlx_vlm.convert keep the vision tower on this
+# architecture, and does mlx_lm.convert handle it at all. If mlx-vlm covers
+# every method needed, the mlx-lm half of this file never gets used.
+mlx_probe() {
+    if [ -z "$1" ]; then
+        echo "mlx_probe SMALL_REPO_FROM_THE_SAME_FAMILY"
+        echo "  mlx_probe Qwen/Qwen3.8-2B"
+        echo
+        echo "confirm the id exists first:  find_repo Qwen3.8"
+        return 1
+    fi
+    local repo="$1"
+    local a=/mlx/probe-vlm
+    local b=/mlx/probe-lm
+    mkdir -p $MLXROOT /logs
+
+    echo "=============== 1. mlx_vlm.convert, the primary path ==============="
+    date
+    rm -rf $a
+    stdbuf -oL -eL mlx_vlm.convert --hf-path "$repo" --mlx-path $a \
+        -q --q-bits 4 --q-group-size 64 2>&1 | tee /logs/mlx-probe-vlm.log
+    echo
+
+    echo "=============== 2. mlx_lm.convert, the fallback ==============="
+    date
+    rm -rf $b
+    stdbuf -oL -eL mlx_lm.convert --hf-path "$repo" --mlx-path $b \
+        -q --q-bits 4 --q-group-size 64 2>&1 | tee /logs/mlx-probe-lm.log
+    echo
+
+    echo "=============== 3. what came out ==============="
+    mlx_inspect $a
+    echo
+    mlx_inspect $b
+    echo
+    echo "=============== 4. reading the result ==============="
+    echo "The vlm build should carry a vision section and vision tensors. If it"
+    echo "does, that is the path for everything and the ladder is one tool."
+    echo
+    echo "The lm build only matters if mlx_caps showed a method that mlx-vlm"
+    echo "does not have. If it also kept the vision section and the same tensor"
+    echo "prefixes, the two are interchangeable. If it dropped the vision half,"
+    echo "that method needs mlx_reattach afterwards. If it refused the model"
+    echo "type outright, that method is unavailable here."
+}
+
+mlx_inspect() {
+    local p="${1:-}"
+    if [ -z "$p" ] || [ ! -d "$p" ]; then
+        echo "mlx_inspect /path/to/checkpoint"
+        return 1
+    fi
+    echo "--- $p  ($(du -sh $p 2>/dev/null | cut -f1)) ---"
+    python3 - "$p" << 'INSPEOF'
+import glob, json, os, sys
+p = sys.argv[1]
+
+cfg_path = os.path.join(p, "config.json")
+if not os.path.exists(cfg_path):
+    print("no config.json, this is not a checkpoint directory")
+    sys.exit(1)
+cfg = json.load(open(cfg_path))
+
+print("model_type   :", cfg.get("model_type"))
+print("architectures:", cfg.get("architectures"))
+print("vision block :", "YES" if ("vision_config" in cfg) else "no")
+print("text block   :", "nested under text_config" if "text_config" in cfg else "flat")
+
+q = cfg.get("quantization")
+if q is None:
+    print("quantization : none, full precision checkpoint")
+else:
+    print("quantization : bits=%s group_size=%s mode=%s"
+          % (q.get("bits"), q.get("group_size"), q.get("mode")))
+    per_layer = {k: v for k, v in q.items() if isinstance(v, dict)}
+    if per_layer:
+        seen = {}
+        for v in per_layer.values():
+            key = (v.get("bits"), v.get("group_size"))
+            seen[key] = seen.get(key, 0) + 1
+        print("per layer    : %d entries" % len(per_layer))
+        for (b, g), n in sorted(seen.items(), key=lambda kv: -kv[1]):
+            print("   %s tensors at bits=%s group=%s" % (n, b, g))
+
+names = []
+try:
+    from safetensors import safe_open
+    for f in sorted(glob.glob(os.path.join(p, "*.safetensors"))):
+        with safe_open(f, framework="np") as h:
+            names.extend(list(h.keys()))
+except Exception as e:
+    print("cannot read tensors:", str(e).splitlines()[0])
+
+if names:
+    prefixes = {}
+    for n in names:
+        head = ".".join(n.split(".")[:2])
+        prefixes[head] = prefixes.get(head, 0) + 1
+    print("tensors      : %d" % len(names))
+    print("prefixes     :")
+    for k, v in sorted(prefixes.items(), key=lambda kv: -kv[1])[:8]:
+        print("   %-34s %d" % (k, v))
+    vis = [n for n in names if "vision" in n or "visual" in n]
+    print("vision tensors: %d" % len(vis))
+INSPEOF
+}
+
+
+# ------------------------------------------------------------------ weights
+
+mlx_src() {
+    mlx_need || return 1
+    if [ -d "$MLX_SRC" ] && ls $MLX_SRC/*.safetensors > /dev/null 2>&1; then
+        echo "already here: $(du -sh $MLX_SRC | cut -f1) in $MLX_SRC"
+        return 0
+    fi
+    echo "pulling the original weights of $UPSTREAM into $MLX_SRC"
+    echo "for a 27B model in bf16 that is around 56 GB"
+    ask "download?" || return 1
+    mkdir -p $MLX_SRC
+    hf download $UPSTREAM --local-dir $MLX_SRC
+    du -sh $MLX_SRC
+}
+
+
+# ------------------------------------------------------------------ the ladder
+
+# mlx_quant BITS [GROUP]
+# The main rung builder. Goes through mlx_vlm.convert so the vision tower
+# survives, which means the result loads in the app with nothing reassembled.
+#
+# BITS is one of 2 3 4 5 6 8. One is loadable but no tool produces it, see
+# mlx_1bit_status.
+#
+# GROUP is how many neighbouring weights share one scale and one offset. The
+# real cost: two 16 bit numbers per group, so group 64 adds 0.5 bits to every
+# weight and group 32 adds 1.0. A four bit build at group 64 is 4.5 bits per
+# weight on disk. Tighter groups are worth the weight at 2 and 3 bits and are
+# not worth it at 6 and 8.
+mlx_quant() {
+    [ -z "$1" ] && { echo "mlx_quant BITS [GROUP]"; return 1; }
+    mlx_need || return 1
+    local bits=$1 group=${2:-$MLX_GROUP} label out rc start
+    label="${bits}bit"; [ "$group" != "64" ] && label="${bits}bit-g${group}"
+    out=$(mlx_out "$label")
+    case "$bits" in 2|3|4|5|6|8) ;; *) echo "bits: 2 3 4 5 6 8"; return 1 ;; esac
+    echo "target : $out"
+    echo "bits   : $bits, group $group, mode affine, method rtn"
+    date; start=$(date +%s); rm -rf "$out"
+    stdbuf -oL -eL mlx_vlm.convert --hf-path "$UPSTREAM" --mlx-path "$out" \
+        -q --q-bits "$bits" --q-group-size "$group" --q-mode affine \
+        --quant-method rtn 2>&1 | tee "/logs/mlx-convert-$label.log"
+    rc=${PIPESTATUS[0]}
+    echo "took $(( $(date +%s) - start )) seconds"
+    [ "$rc" != "0" ] && { rm -rf "$out"; return 1; }
+    mlx_size "$out"
+}
+
+mlx_ver() {
+    python3 - << 'VEREOF'
+from importlib.metadata import version
+for p in ("mlx", "mlx-lm", "mlx-vlm"):
+    try:
+        print("%-8s %s" % (p, version(p)))
+    except Exception as e:
+        print("%-8s not installed" % p)
+VEREOF
+}
+
+
+mlx_quant_text() {
+    echo "mlx_vlm.convert doesn't have --skip-vision flag in this version."
+    echo "text assembles: mlx_quant_lm BITS [GROUP]"
+    return 1
+}
+
+# The fallback text path through mlx-lm. Needed only if the flag above turns
+# out to mean something else, or for a method mlx-vlm does not carry.
+mlx_quant_lm() {
+    if [ -z "$1" ]; then
+        echo "mlx_quant_lm BITS [GROUP]      fallback path through mlx-lm"
+        return 1
+    fi
+    mlx_need || return 1
+    local bits=$1
+    local group=${2:-$MLX_GROUP}
+    local out
+    out=$(mlx_out "${bits}bit-TextOnly-lm")
+
+    rm -rf "$out"
+    stdbuf -oL -eL mlx_lm.convert \
+        --hf-path "$UPSTREAM" --mlx-path "$out" \
+        -q --q-bits "$bits" --q-group-size "$group" \
+        2>&1 | tee "/logs/mlx-convert-${bits}bit-lm.log"
+    mlx_size "$out"
+}
+
+# The whole uniform ladder with the vision tower, one rung after another.
+# Rungs already on disk are skipped, so this is safe to interrupt and resume.
+# Group 32 at the bottom where the extra scales pay for themselves, 64 above.
+mlx_ladder() {
+    mlx_need || return 1
+    local spec n=0 total bits group out label
+    local specs="8:64 6:64 5:64 4:64 4:32 3:32 2:32"
+    total=$(echo $specs | wc -w)
+    for spec in $specs; do
+        bits=${spec%%:*}
+        group=${spec##*:}
+        n=$(( n + 1 ))
+        label="${bits}bit"
+        [ "$group" != "64" ] && label="${bits}bit-g${group}"
+        out=$(mlx_out "$label")
+        echo
+        echo "########## $n of $total: $label ##########"
+        if [ -d "$out" ]; then
+            echo "already built, skipping. Delete $out to redo it."
+            continue
+        fi
+        mlx_quant "$bits" "$group" || echo "rung $label failed, moving on"
+    done
+    echo
+    echo "on disk now:"
+    du -sh $MLXROOT/*/ 2>/dev/null | grep -v probe
+}
+
+
+# ------------------------------------------------------------------ learned
+
+# mlx_awq BITS [SAMPLES]
+# Scales and clips the weights before rounding them, using which activation
+# channels actually carry signal. Cheaper than distillation.
+#
+# The mlx-vlm README lists awq on its converter, so this tries there first and
+# falls back to mlx-lm. Confirm the real option name with mlx_caps and fix the
+# line below if it differs on your version.
+mlx_awq() {
+    [ -z "$1" ] && { echo "mlx_awq BITS [GROUP] [text|multimodal]"; return 1; }
+    mlx_need || return 1
+    local bits=$1 group=${2:-$MLX_GROUP} calib=${3:-text} label out start
+    label="${bits}bit-AWQ"; [ "$group" != "64" ] && label="${bits}bit-g${group}-AWQ"
+    [ "$calib" = "multimodal" ] && label="$label-MM"
+    out=$(mlx_out "$label")
+    echo "target : $out"
+    echo "calib  : $calib"
+    date; start=$(date +%s); rm -rf "$out"
+    stdbuf -oL -eL mlx_vlm.convert --hf-path "$UPSTREAM" --mlx-path "$out" \
+        -q --q-bits "$bits" --q-group-size "$group" --q-mode affine \
+        --quant-method awq --calibration "$calib" \
+        2>&1 | tee "/logs/mlx-awq-$label.log"
+    echo "took $(( $(date +%s) - start )) seconds"
+    mlx_size "$out"
+}
+
+# mlx_dwq BITS [GROUP] [TEACHER]
+# Distillation: gradient descent on the scales and offsets so the quantized
+# model's output moves back toward the full model's output.
+#
+# It repairs damage, so it pays between 2 and 4 bits and does nearly nothing at
+# 6 and 8, where there is not enough damage left to repair. The teacher does
+# not have to be full precision: an 8 bit build works about as well and halves
+# the memory, which is what makes this fit on one card.
+mlx_dwq() {
+    if [ -z "$1" ]; then
+        echo "mlx_dwq BITS [GROUP] [TEACHER_PATH]"
+        echo "  mlx_dwq 4"
+        echo "  mlx_dwq 2 32"
+        echo "  mlx_dwq 3 32 /mlx/<stem>-MLX-8bit      cheaper teacher"
+        return 1
+    fi
+    mlx_need || return 1
+    local bits=$1
+    local group=${2:-32}
+    local teacher=${3:-$UPSTREAM}
+    local label="${bits}bit-DWQ"
+    [ "$group" != "64" ] && label="${bits}bit-g${group}-DWQ"
+
+    case "$bits" in
+        2|3|4) ;;
+        *) echo "$bits bits: distillation has almost nothing to work with here."
+           ask "run it anyway?" || return 1 ;;
+    esac
+
+    local out
+    if grep -qi "dwq" /logs/mlx-help/mlx_vlm.convert.txt 2>/dev/null; then
+        out=$(mlx_out "$label")
+        echo "mlx_vlm.convert advertises dwq, the tower will survive"
+        echo "teacher : $teacher"
+        echo "target  : $out"
+        ask "start?" || return 1
+        rm -rf "$out"
+        stdbuf -oL -eL mlx_vlm.convert \
+            --hf-path "$teacher" --mlx-path "$out" \
+            -q --q-bits "$bits" --q-group-size "$group" \
+            --quant-method dwq \
+            2>&1 | tee "/logs/mlx-dwq-$label.log"
+    else
+        if ! command -v mlx_lm.dwq > /dev/null 2>&1; then
+            echo "no dwq anywhere: not in the mlx_vlm.convert help and no"
+            echo "mlx_lm.dwq command. Run mlx_caps and read the output."
+            return 1
+        fi
+        out=$(mlx_out "$label-TextOnly")
+        echo "going through mlx-lm. The result is text only and needs"
+        echo "mlx_reattach afterwards to see images again."
+        echo "teacher : $teacher"
+        echo "target  : $out"
+        echo
+        echo "if this runs out of memory, in this order: point the teacher at"
+        echo "the 8 bit build, lower --max-seq-length, then --batch-size 1."
+        ask "start?" || return 1
+        rm -rf "$out"
+        stdbuf -oL -eL mlx_lm.dwq \
+            --model "$teacher" --mlx-path "$out" \
+            --bits "$bits" --group-size "$group" \
+            --num-samples 1024 --batch-size 1 --max-seq-length 512 \
+            2>&1 | tee "/logs/mlx-dwq-$label.log"
+    fi
+
+    echo
+    echo "read the loss curve in the log. Oscillating and not falling means the"
+    echo "learning rate is too high. Falling but barely means too low."
+    mlx_size "$out"
+    autopush "/logs/mlx-dwq-$label.log" "logs/mlx-dwq-$label.log"
+}
+
+# Per layer bit allocation. Two different things hide behind this name and
+# mlx_caps tells you which one is available:
+#   a structural recipe, which lifts the first and last blocks and a few
+#   tensor roles by a fixed rule, and
+#   a measured allocation, which quantizes one layer at a time, watches how
+#   far the output moves, and spends the budget where it moves most.
+# The second is the one worth having. The first still beats uniform.
+mlx_mixed() {
+    if [ -z "$1" ]; then
+        echo "mlx_mixed RECIPE"
+        echo "  mixed_2_6 mixed_3_4 mixed_3_5 mixed_3_6 mixed_3_8 mixed_4_6 mixed_4_8"
+        echo "  имя читается так: mixed_2_6 = основная масса в 2 бита,"
+        echo "  чувствительные тензоры в 6"
+        return 1
+    fi
+    mlx_need || return 1
+    local out; out=$(mlx_out "$1")
+    rm -rf "$out"
+    stdbuf -oL -eL mlx_vlm.convert --hf-path "$UPSTREAM" --mlx-path "$out" \
+        -q --q-mode affine --quant-predicate "$1" \
+        2>&1 | tee "/logs/mlx-mixed-$1.log"
+    mlx_size "$out"
+}
+
+# The sensitivity profile, computed once and reused by every measured rung.
+# Same idea as an importance matrix in llama.cpp arrived at from the other
+# side: instead of collecting activation statistics it perturbs one layer at a
+# time and watches the output move.
+mlx_sens() {
+    mlx_need || return 1
+    if [ -f "$MLX_SENS" ]; then
+        echo "already computed: $MLX_SENS"
+        ls -lh "$MLX_SENS"
+        return 0
+    fi
+    if ! command -v mlx_lm.dynamic_quant > /dev/null 2>&1; then
+        echo "mlx_lm.dynamic_quant is not installed. Run mlx_setup."
+        return 1
+    fi
+    mkdir -p $MLXROOT
+    echo "measuring per layer sensitivity of $UPSTREAM"
+    echo "this runs the model many times and is the slow step on the MLX side."
+    echo "Budget an hour or more on a 27B. It happens once."
+    ask "start?" || return 1
+    date
+    local start
+    start=$(date +%s)
+
+    stdbuf -oL -eL mlx_lm.dynamic_quant \
+        --model "$UPSTREAM" \
+        --mlx-path "$(mlx_out AD-probe)" \
+        --target-bpw 4.5 \
+        2>&1 | tee /logs/mlx-sensitivity.log
+
+    echo "took $(( $(date +%s) - start )) seconds"
+    echo
+    echo "the tool writes the profile next to its output. Candidates:"
+    find $MLXROOT /root . -maxdepth 3 -name "*sensitiv*" \
+        -newer /logs/mlx-sensitivity.log 2>/dev/null | head
+    echo "move the right one to $MLX_SENS and the mixed rungs will reuse it."
+    autopush /logs/mlx-sensitivity.log logs/mlx-sensitivity.log
+}
+
+
+# ------------------------------------------------------------------ reattach
+
+# mlx_reattach TEXT_CHECKPOINT VISION_CHECKPOINT OUT
+#
+# Only needed for a method that exists in mlx-lm and not in mlx-vlm. Takes the
+# text tensors from the mlx-lm build, which carry the benefit of distillation
+# or measured allocation, and writes them next to the untouched tower from an
+# mlx-vlm build, under the names the vlm loader expects.
+#
+# The result is a claim, not a result, until it is loaded and shown a picture.
+mlx_reattach() {
+    if [ -z "$3" ]; then
+        echo "mlx_reattach TEXT_CHECKPOINT VISION_CHECKPOINT OUT"
+        echo "  mlx_reattach /mlx/X-4bit-DWQ-TextOnly /mlx/X-4bit /mlx/X-4bit-DWQ"
+        echo
+        echo "the vision checkpoint is used for its tower and its config only,"
+        echo "its text weights are replaced by the ones from the text build."
+        return 1
+    fi
+    python3 - "$1" "$2" "$3" << 'REATTEOF'
+import glob, json, os, shutil, sys
+from safetensors import safe_open
+from safetensors.numpy import save_file
+
+text_p, vis_p, out_p = sys.argv[1:4]
+
+def read_all(path):
+    out = {}
+    for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
+        with safe_open(f, framework="np") as h:
+            for k in h.keys():
+                out[k] = h.get_tensor(k)
+    return out
+
+print("reading text build  :", text_p)
+tw = read_all(text_p)
+print("  %d tensors" % len(tw))
+print("reading vision build:", vis_p)
+vw = read_all(vis_p)
+print("  %d tensors" % len(vw))
+
+if not tw or not vw:
+    print("one of them has no tensors, stopping")
+    sys.exit(1)
+
+sample = sorted(tw.keys())[len(tw) // 2]
+tail = sample.split(".", 1)[1] if "." in sample else sample
+cands = [k for k in vw if k.endswith(tail)]
+if not cands:
+    print()
+    print("cannot match tensor names between the two builds.")
+    print("  text sample:", sample)
+    print("  vlm  sample:", sorted(vw.keys())[len(vw) // 2])
+    print("Look at both with mlx_inspect and map them by hand.")
+    sys.exit(1)
+prefix = cands[0][: len(cands[0]) - len(tail)]
+print("language prefix in the vlm build: %r" % prefix)
+
+merged = {}
+vision_kept = 0
+replaced = 0
+missing = []
+for k, v in vw.items():
+    if k.startswith(prefix):
+        src = k[len(prefix):]
+        if src in tw:
+            merged[k] = tw[src]
+            replaced += 1
+        else:
+            merged[k] = v
+            missing.append(src)
+    else:
+        merged[k] = v
+        vision_kept += 1
+
+print("replaced from the text build : %d" % replaced)
+print("kept from the vlm build      : %d" % vision_kept)
+if missing:
+    print("not found in the text build  : %d, kept as they were" % len(missing))
+    for m in missing[:10]:
+        print("   ", m)
+
+os.makedirs(out_p, exist_ok=True)
+for f in glob.glob(os.path.join(vis_p, "*")):
+    if f.endswith(".safetensors") or f.endswith(".safetensors.index.json"):
+        continue
+    if os.path.isfile(f):
+        shutil.copy2(f, out_p)
+
+tcfg = json.load(open(os.path.join(text_p, "config.json")))
+vcfg = json.load(open(os.path.join(out_p, "config.json")))
+if "quantization" in tcfg:
+    vcfg["quantization"] = tcfg["quantization"]
+    json.dump(vcfg, open(os.path.join(out_p, "config.json"), "w"), indent=2)
+    print("copied the quantization block from the text build into the config")
+
+save_file(merged, os.path.join(out_p, "model.safetensors"))
+size = os.path.getsize(os.path.join(out_p, "model.safetensors"))
+print()
+print("wrote %s, %.2f GB" % (out_p, size / 1e9))
+print()
+print("now load it and show it a picture. Until then this is a claim.")
+REATTEOF
+}
+
+
+# ------------------------------------------------------------------ size
+
+mlx_size() {
+    local p="${1:-}"
+    if [ -z "$p" ] || [ ! -d "$p" ]; then
+        echo "mlx_size /path/to/checkpoint"
+        return 1
+    fi
+    python3 - "$p" "$MLX_SRC" << 'SIZEEOF'
+import glob, json, os, sys
+p, src = sys.argv[1], sys.argv[2]
+
+total = sum(os.path.getsize(f) for f in glob.glob(os.path.join(p, "*.safetensors")))
+print("on disk      : %.2f GB  (%.2f GiB)" % (total / 1e9, total / 2 ** 30))
+
+params = None
+idx = os.path.join(src, "model.safetensors.index.json")
+if os.path.exists(idx):
+    meta = json.load(open(idx)).get("metadata", {})
+    if "total_size" in meta:
+        params = meta["total_size"] // 2
+
+if params:
+    print("parameters   : %.2f B  (from the bf16 source index)" % (params / 1e9))
+    print("bits/weight  : %.3f" % (total * 8 / params))
+else:
+    print("parameters   : unknown, no source index at %s" % idx)
+    print("               run mlx_src to get the real bits per weight")
+SIZEEOF
+}
+
+
+# ------------------------------------------------------------------ measurement
+
+# There is no tool for this upstream. Both libraries ship perplexity and
+# downstream task evaluation, neither of which compares a quant against a
+# reference model.
+#
+# In llama.cpp the reference logits go to disk because the two runs are
+# separate processes. Here both models are objects in one process, so the
+# divergence is accumulated on the fly and nothing large is written.
+#
+# Every number this prints is defined in the script. Read the definitions
+# before putting them in a table next to somebody else's.
+
+mlx_ref() {
+    if [ -z "$1" ]; then
+        echo "mlx_ref PATH_OR_REPO      current: ${MLX_REF:-not set}"
+        echo "  mlx_ref $UPSTREAM"
+        echo "  mlx_ref $(mlx_out 8bit)   cheaper, and shifts every number"
+        return 1
+    fi
+    MLX_REF=$1
+    echo "reference is now $MLX_REF"
+    echo "put it in the card. A number measured against a different reference"
+    echo "is not the same number."
+}
+
+mlx_kld() {
+    local q="${1:-}"
+    if [ -z "$q" ]; then
+        echo "mlx_kld /path/to/checkpoint"
+        ls -d $MLXROOT/*/ 2>/dev/null | sed "s/^/   /"
+        return 1
+    fi
+    if [ -z "$MLX_REF" ]; then
+        echo "no reference set. Run mlx_ref first."
+        return 1
+    fi
+    if [ ! -f "$MLX_EVAL" ]; then
+        echo "no corpus at $MLX_EVAL. Run get_eval."
+        return 1
+    fi
+    local name
+    name=$(basename "$q")
+    mkdir -p /logs
+
+    echo "reference : $MLX_REF"
+    echo "quant     : $q"
+    echo "corpus    : $MLX_EVAL"
+    echo "window    : $MLX_CTX tokens, math in blocks of $MLX_STEP"
+    echo
+
+    stdbuf -oL -eL python3 - "$MLX_REF" "$q" "$MLX_EVAL" "$MLX_CTX" "$MLX_STEP" \
+        "/logs/mlx-kld-$name.json" 2>&1 | tee "/logs/mlx-kld-$name.log" << 'KLDEOF'
+import json, math, os, sys, time
+import mlx.core as mx
+
+# mlx_lm.load opens a vision checkpoint text-only, which is what is wanted
+# here: this measures the language half, the half every quant touches.
+from mlx_lm import load
+
+ref_path, qnt_path, corpus, ctx, step, out_json = sys.argv[1:7]
+ctx, step = int(ctx), int(step)
+
+print("loading the reference")
+ref_model, tok = load(ref_path)
+print("loading the quant")
+qnt_model, _ = load(qnt_path)
+
+text = open(corpus, encoding="utf-8", errors="replace").read()
+ids = tok.encode(text)
+n_win = len(ids) // ctx
+print("corpus: %d tokens, %d windows of %d" % (len(ids), n_win, ctx))
+if n_win < 2:
+    print("too few windows to say anything. Longer corpus or shorter window.")
+    sys.exit(1)
+
+klds = []
+top1_hits = 0
+top1_total = 0
+dp_abs = []
+dp_rel = []
+t0 = time.time()
+
+for w in range(n_win):
+    chunk = ids[w * ctx:(w + 1) * ctx]
+    x = mx.array([chunk])
+    lr = ref_model(x)[0]
+    lq = qnt_model(x)[0]
+    mx.eval(lr, lq)
+
+    # position t predicts token t+1, so the last position has no target
+    for s in range(0, ctx - 1, step):
+        e = min(s + step, ctx - 1)
+        a = lr[s:e].astype(mx.float32)
+        b = lq[s:e].astype(mx.float32)
+        logp = a - mx.logsumexp(a, axis=-1, keepdims=True)
+        logq = b - mx.logsumexp(b, axis=-1, keepdims=True)
+        p = mx.exp(logp)
+        k = mx.sum(p * (logp - logq), axis=-1)
+        hits = mx.sum(mx.argmax(a, axis=-1) == mx.argmax(b, axis=-1))
+
+        tgt = mx.array(chunk[s + 1:e + 1])
+        rows = mx.arange(e - s)
+        p_true = mx.exp(logp[rows, tgt])
+        q_true = mx.exp(logq[rows, tgt])
+        d_abs = (q_true - p_true) * 100.0
+        d_rel = (q_true - p_true) / mx.maximum(p_true, 1e-12) * 100.0
+
+        mx.eval(k, hits, d_abs, d_rel)
+        klds.extend([float(v) for v in k])
+        top1_hits += int(hits)
+        top1_total += (e - s)
+        dp_abs.extend([float(v) for v in d_abs])
+        dp_rel.extend([float(v) for v in d_rel])
+
+    del lr, lq
+
+    if (w + 1) % 5 == 0 or w == n_win - 1:
+        el = time.time() - t0
+        rate = (w + 1) / el
+        eta = (n_win - w - 1) / rate
+        print("  window %d/%d   %.2f win/s   eta %d min %02d s"
+              % (w + 1, n_win, rate, eta // 60, eta % 60), flush=True)
+
+klds.sort()
+
+def q(frac):
+    return klds[min(len(klds) - 1, int(len(klds) * frac))]
+
+def rms(v):
+    return math.sqrt(sum(x * x for x in v) / len(v))
+
+res = {
+    "reference": ref_path,
+    "quant": qnt_path,
+    "corpus": os.path.basename(corpus),
+    "window": ctx,
+    "tokens_scored": len(klds),
+    "mean_kld": sum(klds) / len(klds),
+    "median_kld": q(0.50),
+    "p90_kld": q(0.90),
+    "p95_kld": q(0.95),
+    "p99_kld": q(0.99),
+    "max_kld": klds[-1],
+    "top1_agree_pct": 100.0 * top1_hits / top1_total,
+    "mean_delta_p_points": sum(dp_abs) / len(dp_abs),
+    "rms_delta_p_points": rms(dp_abs),
+    "mean_delta_p_relative_pct": sum(dp_rel) / len(dp_rel),
+    "rms_delta_p_relative_pct": rms(dp_rel),
+}
+json.dump(res, open(out_json, "w"), indent=2)
+
+print()
+print("tokens scored     : %d" % res["tokens_scored"])
+print("mean KLD          : %.6f" % res["mean_kld"])
+print("median KLD        : %.6f" % res["median_kld"])
+print("90 / 95 / 99 pct  : %.6f  %.6f  %.6f" % (res["p90_kld"], res["p95_kld"], res["p99_kld"]))
+print("max KLD           : %.6f" % res["max_kld"])
+print("same top-1        : %.3f %%" % res["top1_agree_pct"])
+print("delta p, points   : mean %.4f   rms %.4f" % (res["mean_delta_p_points"], res["rms_delta_p_points"]))
+print("delta p, relative : mean %.4f %%  rms %.4f %%" % (res["mean_delta_p_relative_pct"], res["rms_delta_p_relative_pct"]))
+print()
+print("definitions used here:")
+print("  KLD is the sum over the vocabulary of p*(log p - log q), reference")
+print("  first. Same top-1 is how often both models rank the same token")
+print("  highest. Delta p in points is (q - p)*100 on the probability of the")
+print("  token that actually comes next in the corpus, relative is the same")
+print("  divided by p. llama.cpp reports one of those two under the name RMS")
+print("  delta p. Check which one before putting these beside GGUF numbers.")
+print()
+print("written to %s" % out_json)
+KLDEOF
+
+    autopush "/logs/mlx-kld-$name.log" "logs/mlx-kld-$name.log"
+    autopush "/logs/mlx-kld-$name.json" "logs/mlx-kld-$name.json"
+}
+
+mlx_kld_all() {
+    if [ -z "$MLX_REF" ]; then
+        echo "no reference set. Run mlx_ref first."
+        return 1
+    fi
+    local d name todo="" n=0 total
+    for d in $MLXROOT/*/; do
+        [ -f "$d/config.json" ] || continue
+        name=$(basename "$d")
+        case "$name" in probe-*) continue ;; esac
+        [ "$d" = "$MLX_REF/" ] && continue
+        if [ -f "/logs/mlx-kld-$name.json" ] && [ "$KLD_FORCE" != "1" ]; then
+            echo "already measured: $name"
+            continue
+        fi
+        todo="$todo $d"
+    done
+    if [ -z "$todo" ]; then
+        echo "everything here is measured. KLD_FORCE=1 mlx_kld_all to redo."
+        mlx_results
+        return 0
+    fi
+    total=$(echo $todo | wc -w)
+    for d in $todo; do
+        n=$(( n + 1 ))
+        echo
+        echo "########## $n of $total ##########"
+        mlx_kld "${d%/}"
+    done
+    mlx_results
+}
+
+mlx_results() {
+    python3 - "$MLXROOT" << 'RESEOF'
+import glob, json, os, sys
+root = sys.argv[1]
+
+rows = []
+for p in sorted(glob.glob("/logs/mlx-kld-*.json")):
+    try:
+        r = json.load(open(p))
+    except Exception:
+        continue
+    name = os.path.basename(p)[len("mlx-kld-"):-len(".json")]
+    d = os.path.join(root, name)
+    size = 0
+    if os.path.isdir(d):
+        size = sum(os.path.getsize(f) for f in glob.glob(os.path.join(d, "*.safetensors")))
+    r["name"] = name
+    r["size_gb"] = round(size / 1e9, 2) if size else None
+    rows.append(r)
+
+rows.sort(key=lambda r: r.get("size_gb") or 0)
+json.dump(rows, open("/logs/mlx-results.json", "w"), indent=2)
+
+print("%-44s %8s %11s %10s %11s" % ("build", "GB", "mean KLD", "top-1 %", "rms dp pts"))
+for r in rows:
+    print("%-44s %8s %11s %10s %11s" % (
+        r["name"][-44:], r.get("size_gb", ""),
+        round(r["mean_kld"], 6),
+        round(r["top1_agree_pct"], 3),
+        round(r["rms_delta_p_points"], 3)))
+print()
+print("%d builds, written to /logs/mlx-results.json" % len(rows))
+if rows:
+    print("reference for all of these: %s" % rows[0]["reference"])
+RESEOF
+    autopush /logs/mlx-results.json "mlx-results-$(hostname).json"
+}
+
+
+# ------------------------------------------------------------------ publishing
+
+mlx_push() {
+    if [ -z "$2" ]; then
+        echo "mlx_push CHECKPOINT LABEL"
+        echo "  mlx_push /mlx/Qwen3.8-27B-MLX-4bit 4bit"
+        return 1
+    fi
+    mlx_need || return 1
+    token_check > /dev/null || return 1
+    if [ ! -d "$1" ]; then
+        echo "no checkpoint at $1"
+        return 1
+    fi
+    scan_secrets "$1" || return 1
+    local repo
+    repo=$(mlx_repo "$2")
+    echo "$1  ->  $repo   ($(du -sh $1 | cut -f1))"
+    ask "upload?" || return 1
+    stdbuf -oL -eL mlx_lm.upload --path "$1" --upload-repo "$repo" \
+        2>&1 | tee "/logs/mlx-upload-$2.log"
+    echo
+    echo "users load it as:  mlx_vlm.generate --model $repo --image pic.jpg"
+}
+
+mlx_push_all() {
+    mlx_need || return 1
+    local d name label
+    for d in $MLXROOT/*/; do
+        [ -f "$d/config.json" ] || continue
+        name=$(basename "$d")
+        case "$name" in probe-*) continue ;; esac
+        label=${name#"$(mlx_stem)-MLX-"}
+        echo
+        echo "=== $name ==="
+        mlx_push "${d%/}" "$label"
+    done
+}
+
+
+# ------------------------------------------------------------------ orientation
+
+mlx_status() {
+    echo
+    if [ -z "$UPSTREAM" ]; then
+        echo "  [ ] preset             ->  use_model NAME REPO"
+    else
+        echo "  [x] upstream: $UPSTREAM"
+        echo "      builds: $MLXROOT/$(mlx_stem)-MLX-*"
+        echo "      repos : $(mlx_repo '<label>')"
+    fi
+    if command -v mlx_vlm.convert > /dev/null 2>&1; then
+        echo "  [x] mlx-vlm installed  (the primary tool)"
+    else
+        echo "  [ ] mlx-vlm            ->  mlx_setup"
+    fi
+    if [ -f /logs/mlx-help/mlx_vlm.convert.txt ]; then
+        echo "  [x] capabilities known ->  mlx_caps to refresh"
+    else
+        echo "  [ ] capabilities       ->  mlx_caps    (do not skip this)"
+    fi
+    if [ -d /mlx/probe-vlm ]; then
+        echo "  [x] probe done         ->  mlx_inspect /mlx/probe-vlm"
+    else
+        echo "  [ ] probe not done     ->  mlx_probe <small model, same family>"
+    fi
+    if [ -d "$MLX_SRC" ] && ls $MLX_SRC/*.safetensors > /dev/null 2>&1; then
+        echo "  [x] source weights     ($(du -sh $MLX_SRC 2>/dev/null | cut -f1))"
+    else
+        echo "  [ ] source weights     ->  mlx_src"
+    fi
+    local n
+    n=$(ls -d $MLXROOT/*/ 2>/dev/null | grep -v probe | wc -l)
+    echo "  [$([ $n -gt 0 ] && echo x || echo ' ')] builds on disk: $n   ->  mlx_ladder"
+    if [ -n "$MLX_REF" ]; then
+        echo "  [x] reference: $MLX_REF"
+    else
+        echo "  [ ] reference          ->  mlx_ref PATH_OR_REPO"
+    fi
+    n=$(ls /logs/mlx-kld-*.json 2>/dev/null | wc -l)
+    echo "  [$([ $n -gt 0 ] && echo x || echo ' ')] measurements: $n     ->  mlx_kld_all"
+    echo
+    echo "  full list: mlx_help"
+    echo
+}
+
+mlx_help() {
+cat << 'MLXHELPEOF'
+
+SETUP        mlx_setup | mlx_check | mlx_caps | mlx_status
+             mlx_caps is not optional. It reports what the installed versions
+             actually give you, which is the only thing worth planning around.
+
+DAY ZERO     mlx_probe SMALL_REPO | mlx_inspect PATH | mlx_1bit_status
+
+WEIGHTS      mlx_src
+
+LADDER       mlx_quant BITS [GROUP]       primary, keeps the vision tower
+             mlx_quant_text BITS [GROUP]  same rung without the tower
+             mlx_quant_lm BITS [GROUP]    fallback through mlx-lm
+             mlx_ladder                   the whole uniform grid
+             bits: 2 3 4 5 6 8. One loads but nothing produces it.
+
+LEARNED      mlx_awq BITS [SAMPLES]
+             mlx_dwq BITS [GROUP] [TEACHER]
+             mlx_sens
+             mlx_mixed RECIPE | mlx_mixed BPW LOW HIGH
+
+VISION       mlx_reattach TEXT VISION OUT
+             only for a method mlx-vlm does not have
+
+MEASURE      mlx_ref PATH | mlx_kld PATH | mlx_kld_all | mlx_results
+             mlx_size PATH
+
+PUBLISH      mlx_push PATH LABEL | mlx_push_all
+
+ORDER THAT WORKS
+
+  mlx_setup ; mlx_check ; mlx_caps
+  mlx_1bit_status                    read it, that gap is the opportunity
+  mlx_probe Qwen/Qwen3.8-2B          read the verdict before continuing
+  mlx_src
+  mlx_ladder                         the uniform grid, tower included
+  mlx_ref <upstream or the 8bit build>
+  mlx_kld_all ; mlx_results          numbers before publishing, not after
+  mlx_push_all
+  mlx_awq 4 ; mlx_dwq 4 32 ; mlx_dwq 3 32 ; mlx_dwq 2 32
+  mlx_sens ; mlx_mixed 2.6 2 4 ; mlx_mixed 3.4 3 5
+  mlx_kld_all ; mlx_results          one graph out of the whole grid
+
+MLXHELPEOF
+}
 
 # ================================================================== state
 # Read back whatever the last pane set, so a fresh tmux tab is not amnesiac.
