@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-20.01
+FOUNDRY_VERSION=2026-08-21.02
 
 # ------------------------------------------------------------------ settings
 # These live here and nowhere else. An earlier edit lost them, which left BIN,
@@ -263,7 +263,13 @@ selfcheck() {
              im_status push_shards push_quants catch_up audit del_model \
              del_old_ad plan ls_main ls_metrics ls_corpora \
              get_recipe use_gpus apply_gpus list_repo fetch_one \
-             write_kld_readme send_base get_base; do
+             write_kld_readme send_base get_base \
+             is_mac mac_setup mac_info mac_memory mac_build mac_get \
+             speed_note speed_gguf speed_mlx speed_all speed_report \
+             kld_install mlx_kld_selftest mlx_kld2 mlx_kld2_all \
+             mlx_results2 ppl_compare help_measure \
+             cuda_arch disk_plan mlx_reference mlx_get_ours \
+             mlx_ext_list mlx_get_external mlx_audit; do
         type -t $f > /dev/null 2>&1 || missing="$missing $f"
     done
     if [ -n "$missing" ]; then
@@ -309,6 +315,9 @@ MEASURE       get_eval | get_eval_set NAME | eval_size | set_ctx N | base
 
 UPLOAD        push_base | push_logs | push_results | push_quants | push_model FILE
               push_model_split FILE | push_card FILE | send_base user@host PORT
+
+MLX           mlx_help       the whole MLX side
+MEASURE v2    help_measure   mac setup, matched speed, llama.cpp style kld
 
 HELP_EOF
 }
@@ -1679,27 +1688,24 @@ find_bf16() {
     local stem all
     stem=$(model_stem)
     all=$(find /gguf -name "*.gguf" 2>/dev/null | grep -i bf16 \
+          | grep -v "/mmproj-" | grep -v "/mtp-" \
+          | grep -v "mmproj" | grep -v "^/gguf/mtp-" \
           | grep -v "/dflash-" | grep -v "/dspark-")
-
     if [ -n "$stem" ]; then
         local mine
         mine=$(echo "$all" | grep -F "$stem")
         if [ -z "$mine" ] && [ -n "$all" ]; then
             echo "there are bf16 files here, but none belongs to $stem:"
             echo "$all" | sed "s/^/   /"
-            echo "this box was used for another model. Run get_bf16, or"
-            echo "make_bf16, or free the disk with clean_gguf."
             return 1
         fi
         all=$mine
     fi
-
     FOUND=$(echo "$all" | grep "00001-of-" | head -1)
+    [ -z "$FOUND" ] && FOUND=$(echo "$all" | head -1)
     if [ -z "$FOUND" ]; then
-        FOUND=$(echo "$all" | head -1)
-    fi
-    if [ -z "$FOUND" ]; then
-        echo "no bf16 for $stem in /gguf. Run get_bf16 or make_bf16."
+        echo "no bf16 model for $stem in /gguf (mmproj does not count)."
+        echo "Build it:  setup_convert ; make_bf16"
         return 1
     fi
     BF16_FIRST=$FOUND
@@ -4456,7 +4462,7 @@ VEREOF
 
 mlx_quant_text() {
     echo "mlx_vlm.convert doesn't have --skip-vision flag in this version."
-    echo "text assembles: mlx_quant_lm BITS [GROUP]"
+    echo "text only builds go through:  mlx_quant_lm BITS [GROUP]"
     return 1
 }
 
@@ -4620,8 +4626,8 @@ mlx_mixed() {
     if [ -z "$1" ]; then
         echo "mlx_mixed RECIPE"
         echo "  mixed_2_6 mixed_3_4 mixed_3_5 mixed_3_6 mixed_3_8 mixed_4_6 mixed_4_8"
-        echo "  имя читается так: mixed_2_6 = основная масса в 2 бита,"
-        echo "  чувствительные тензоры в 6"
+        echo "  read the name as: mixed_2_6 puts the bulk at 2 bits and the"
+        echo "  sensitive tensors at 6"
         return 1
     fi
     mlx_need || return 1
@@ -5191,6 +5197,1074 @@ ORDER THAT WORKS
 
 MLXHELPEOF
 }
+
+# ================================================================== MEASURE
+#
+# One protocol for both engines, and a Mac that starts from nothing.
+#
+# Three things this block exists to fix.
+#
+#   The KLD script written earlier did not follow llama.cpp's conventions.
+#   llama.cpp scores only the second half of each chunk, so every scored token
+#   has at least half a context behind it. The earlier script scored from
+#   position zero, which counts tokens the model predicted almost blind, and
+#   those are exactly where a quant looks worst. Every MLX number measured
+#   before this block is therefore pessimistic and has to be redone.
+#
+#   Speed and quality are different measurements and people keep mixing their
+#   settings. Quality is llama-perplexity with -c 4096: context is how much
+#   text the model sees while predicting. Speed is llama-bench with -p 512
+#   -n 128: those are how many tokens to feed and to generate for timing, and
+#   -d is where context enters. Both are in the existing bench function
+#   already; nothing here changes the numbers, it only adds depth.
+#
+#   A Mac cannot use the paths this file assumes. Nothing can be created at /
+#   on macOS, so FROOT redirects everything under $HOME/foundry there and
+#   stays empty on Linux, where /gguf and /logs keep working as before.
+
+FOUNDRY_OS=$(uname -s)
+if [ "$FOUNDRY_OS" = "Darwin" ]; then
+    FROOT=${FROOT:-$HOME/foundry}
+else
+    FROOT=${FROOT:-}
+fi
+
+GGUF_DIR=${GGUF_DIR:-$FROOT/gguf}
+MLX_DIR=${MLX_DIR:-$FROOT/mlx}
+LOG_DIR=${LOG_DIR:-$FROOT/logs}
+EVAL_DIR=${EVAL_DIR:-$FROOT/eval}
+
+# One protocol, written down once. Change it here or nowhere.
+SPEED_PROMPT=${SPEED_PROMPT:-512}
+SPEED_GEN=${SPEED_GEN:-128}
+SPEED_DEPTHS=${SPEED_DEPTHS:-"0 4096 16384"}
+SPEED_REPS=${SPEED_REPS:-5}
+SPEED_COOL=${SPEED_COOL:-45}
+
+# Quality. These match the GGUF metrics repo exactly so the two ladders can go
+# in one table: context 4096, the neutral held-out set, second half scored.
+Q_CTX=${Q_CTX:-4096}
+Q_FIRST=${Q_FIRST:-}          # empty means ctx/2, which is what llama.cpp uses
+Q_STEP=${Q_STEP:-64}          # how many positions the vocabulary math takes at once
+
+
+is_mac() { [ "$FOUNDRY_OS" = "Darwin" ]; }
+
+
+# ------------------------------------------------------------------ mac setup
+
+# A Mac Studio with nothing on it. Run these in order.
+mac_setup() {
+    if ! is_mac; then
+        echo "this is not a Mac. On Linux use setup and build."
+        return 1
+    fi
+    echo "=== command line tools ==="
+    if ! xcode-select -p > /dev/null 2>&1; then
+        echo "installing, accept the dialog then rerun mac_setup"
+        xcode-select --install
+        return 1
+    fi
+    echo "present at $(xcode-select -p)"
+
+    echo
+    echo "=== homebrew ==="
+    if ! command -v brew > /dev/null 2>&1; then
+        echo "not installed. Install it, then rerun:"
+        echo '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+        return 1
+    fi
+    brew list cmake > /dev/null 2>&1 || brew install cmake
+    brew list git > /dev/null 2>&1 || brew install git
+    echo "cmake $(cmake --version | head -1)"
+
+    echo
+    echo "=== python packages ==="
+    pip3 install --break-system-packages -q -U "huggingface_hub[hf_xet]" \
+        mlx mlx-lm mlx-vlm || return 1
+
+    mkdir -p $GGUF_DIR $MLX_DIR $LOG_DIR $EVAL_DIR
+    echo
+    mac_info
+    echo
+    echo "next:  mac_build   then   mac_memory"
+}
+
+mac_info() {
+    is_mac || { echo "not a Mac"; return 1; }
+    {
+        echo "chip     : $(sysctl -n machdep.cpu.brand_string)"
+        echo "cores    : $(sysctl -n hw.ncpu)"
+        echo "memory   : $(( $(sysctl -n hw.memsize) / 1000000000 )) GB unified"
+        echo "macos    : $(sw_vers -productVersion)"
+        python3 - << 'PYEOF'
+from importlib.metadata import version
+for p in ("mlx", "mlx-lm", "mlx-vlm", "huggingface_hub"):
+    try:
+        print("%-16s %s" % (p, version(p)))
+    except Exception:
+        print("%-16s not installed" % p)
+PYEOF
+    } | tee $LOG_DIR/mac-env.txt
+    echo
+    echo "written to $LOG_DIR/mac-env.txt, it ships with the results"
+}
+
+# macOS caps how much of the unified memory the GPU may wire down. The default
+# is around three quarters of what is installed, which on a 64 GB machine is
+# roughly 48 GB. A 29.5 GB model plus its context fits, a 51 GB one does not,
+# and the failure looks like a crash rather than a message.
+mac_memory() {
+    is_mac || return 1
+    local total limit
+    total=$(( $(sysctl -n hw.memsize) / 1048576 ))
+    limit=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
+    echo "installed        : $(( total / 1024 )) GB"
+    if [ "$limit" = "0" ]; then
+        echo "gpu wired limit  : default, about $(( total * 75 / 100 / 1024 )) GB"
+    else
+        echo "gpu wired limit  : $(( limit / 1024 )) GB (set explicitly)"
+    fi
+    echo
+    echo "largest model that fits comfortably: leave 8 GB for the system and"
+    echo "for the attention cache, so about $(( total * 75 / 100 / 1024 - 8 )) GB of weights."
+    echo
+    echo "to raise it, until the next reboot:"
+    echo "  sudo sysctl iogpu.wired_limit_mb=$(( total * 90 / 100 ))"
+    echo
+    echo "Raising it starves the system. Do it for one measurement, not as a"
+    echo "permanent setting, and never past 90 percent."
+}
+
+mac_build() {
+    is_mac || return 1
+    mkdir -p $FROOT
+    if [ -d $FROOT/llama.cpp ]; then
+        echo "already cloned, pulling"
+        git -C $FROOT/llama.cpp pull --ff-only
+    else
+        git clone https://github.com/ggml-org/llama.cpp $FROOT/llama.cpp || return 1
+    fi
+    cd $FROOT/llama.cpp
+    git rev-parse --short HEAD > $LOG_DIR/llama-commit.txt
+    echo "commit $(cat $LOG_DIR/llama-commit.txt)"
+
+    # Metal is on by default on macOS. Naming it makes the build reproducible
+    # rather than dependent on what cmake guesses.
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON || return 1
+    cmake --build build -j "$(sysctl -n hw.ncpu)" --target \
+        llama-bench llama-cli llama-perplexity llama-mtmd-cli || return 1
+
+    MACBIN=$FROOT/llama.cpp/build/bin
+    ls -la $MACBIN
+    echo
+    echo "MACBIN=$MACBIN"
+    echo "next:  mac_get   to pull the ladders"
+}
+
+MACBIN=${MACBIN:-$FROOT/llama.cpp/build/bin}
+
+# Pull our own published ladders onto the Mac. Nothing is built here, this
+# machine only measures.
+mac_get() {
+    local what="${1:-}"
+    if [ -z "$what" ]; then
+        echo "mac_get gguf | mlx | eval | all"
+        return 1
+    fi
+    mkdir -p $GGUF_DIR $MLX_DIR $EVAL_DIR
+    case "$what" in
+        gguf|all)
+            echo "=== gguf ladder, about 250 GB ==="
+            ask "download?" && hf download AtomicChat/Qwen3.8-27B-GGUF \
+                --include "*.gguf" --exclude "*BF16*" --exclude "*bf16*" \
+                --local-dir $GGUF_DIR
+            ;;&
+        mlx|all)
+            echo "=== mlx ladder, one directory per rung ==="
+            local r
+            for r in mixed_3_4 4bit mixed_4_6 5bit 6bit 8bit; do
+                echo "  $r"
+                hf download AtomicChat/Qwen3.8-27B-MLX-$r \
+                    --local-dir $MLX_DIR/Qwen3.8-27B-MLX-$r > /dev/null || echo "   failed"
+            done
+            ;;&
+        eval|all)
+            hf download AtomicChat/calib-corpora --repo-type dataset \
+                --include "eval/neutral/eval_neutral.txt" --local-dir $EVAL_DIR
+            find $EVAL_DIR -name "eval_neutral.txt" -exec cp {} $EVAL_DIR/neutral.txt \;
+            ls -lh $EVAL_DIR/neutral.txt
+            ;;
+    esac
+    echo
+    du -sh $GGUF_DIR $MLX_DIR 2>/dev/null
+}
+
+
+# ------------------------------------------------------------------ speed
+
+# Both engines, one protocol. Nothing here is engine specific except which
+# binary runs: prompt length, generation length, cache depth, repetitions and
+# cooldown are identical, so the two columns can sit in one table.
+#
+# Speed is the one number where comparing across engines is legitimate. A user
+# on a Mac does not care whose kernels are faster, only how many tokens per
+# second appear. Quality is the opposite and needs the reference treatment.
+
+speed_note() {
+    echo "protocol : $SPEED_PROMPT prompt tokens, $SPEED_GEN generated,"
+    echo "           depths [$SPEED_DEPTHS], $SPEED_REPS repetitions, median"
+    echo "           $SPEED_COOL s cooldown between models"
+    echo
+    echo "prefill is how fast your prompt is read, decode is how fast the answer"
+    echo "is written. Decode at depth 0 is the best case nobody experiences,"
+    echo "because the attention cache grows with the conversation and reading it"
+    echo "back is what slows generation down. The depth 4096 row is the honest one."
+}
+
+speed_gguf() {
+    local f="${1:-}"
+    if [ -z "$f" ] || [ ! -f "$f" ]; then
+        echo "speed_gguf /path/to/quant.gguf"
+        ls $GGUF_DIR/*.gguf 2>/dev/null | sed "s/^/   /"
+        return 1
+    fi
+    if [ ! -x "$MACBIN/llama-bench" ] && [ ! -x "$BIN/llama-bench" ]; then
+        echo "no llama-bench. Run mac_build, or build on Linux."
+        return 1
+    fi
+    local bench=$MACBIN/llama-bench
+    [ -x "$bench" ] || bench=$BIN/llama-bench
+
+    local name d depth_flag=""
+    name=$(basename "$f" .gguf)
+    if "$bench" --help 2>&1 | grep -q -- "-d,"; then
+        depth_flag=yes
+    else
+        echo "this llama-bench has no -d flag, depth 0 only. Update llama.cpp."
+    fi
+    mkdir -p $LOG_DIR
+
+    echo "### gguf: $name   $(du -h "$f" | cut -f1)"
+    if [ -n "$depth_flag" ]; then
+        for d in $SPEED_DEPTHS; do
+            echo "  depth $d"
+            "$bench" -m "$f" -p "$SPEED_PROMPT" -n "$SPEED_GEN" -d "$d" \
+                -ngl 99 -r "$SPEED_REPS" -o json \
+                > "$LOG_DIR/speed-gguf-$name-d$d.json" 2>"$LOG_DIR/speed-gguf-$name-d$d.err"
+        done
+    else
+        "$bench" -m "$f" -p "$SPEED_PROMPT" -n "$SPEED_GEN" \
+            -ngl 99 -r "$SPEED_REPS" -o json \
+            > "$LOG_DIR/speed-gguf-$name-d0.json" 2>"$LOG_DIR/speed-gguf-$name-d0.err"
+    fi
+    echo "  done"
+}
+
+speed_mlx() {
+    local d="${1:-}"
+    if [ -z "$d" ] || [ ! -f "$d/config.json" ]; then
+        echo "speed_mlx /path/to/checkpoint"
+        ls -d $MLX_DIR/*/ 2>/dev/null | sed "s/^/   /"
+        return 1
+    fi
+    kld_install > /dev/null
+    local name
+    name=$(basename "${d%/}")
+    echo "### mlx: $name   $(du -sh "$d" | cut -f1)"
+    stdbuf -oL -eL python3 $FROOT/speed_mlx.py "${d%/}" \
+        "$SPEED_PROMPT" "$SPEED_GEN" "$SPEED_REPS" "$SPEED_DEPTHS" \
+        "$LOG_DIR/speed-mlx-$name.json"
+}
+
+# Everything on this machine, both engines, with cooldowns. The first model is
+# repeated at the end: if that repeat differs by more than a few percent the
+# machine got hot and the whole session should be thrown away.
+speed_all() {
+    speed_note
+    echo
+    mac_info 2>/dev/null | head -4
+    echo
+    local first="" f d
+    for f in $GGUF_DIR/*.gguf; do
+        [ -f "$f" ] || continue
+        case "$f" in *mmproj*|*BF16*|*bf16*) continue ;; esac
+        [ -z "$first" ] && first="$f"
+        speed_gguf "$f"
+        echo "cooling $SPEED_COOL s"
+        sleep $SPEED_COOL
+    done
+    for d in $MLX_DIR/*/; do
+        [ -f "$d/config.json" ] || continue
+        case "$d" in *bf16*|*probe*) continue ;; esac
+        speed_mlx "${d%/}"
+        echo "cooling $SPEED_COOL s"
+        sleep $SPEED_COOL
+    done
+    if [ -n "$first" ]; then
+        echo
+        echo "### thermal check: repeating the first model ###"
+        local n
+        n=$(basename "$first" .gguf)
+        cp "$LOG_DIR/speed-gguf-$n-d0.json" "$LOG_DIR/thermal-before.json" 2>/dev/null
+        speed_gguf "$first"
+        cp "$LOG_DIR/speed-gguf-$n-d0.json" "$LOG_DIR/thermal-after.json" 2>/dev/null
+    fi
+    speed_report
+}
+
+speed_report() {
+    python3 - "$LOG_DIR" << 'SPEEDREPEOF'
+import glob, json, os, sys
+log = sys.argv[1]
+rows = []
+
+for p in sorted(glob.glob(os.path.join(log, "speed-gguf-*.json"))):
+    try:
+        data = json.load(open(p))
+    except Exception:
+        continue
+    base = os.path.basename(p)[len("speed-gguf-"):-len(".json")]
+    name, _, depth = base.rpartition("-d")
+    pp = tg = None
+    for e in data:
+        if e.get("n_prompt", 0) > 0:
+            pp = e.get("avg_ts")
+        elif e.get("n_gen", 0) > 0:
+            tg = e.get("avg_ts")
+    rows.append({"engine": "gguf", "name": name, "depth": int(depth or 0),
+                 "prefill": pp, "decode": tg})
+
+for p in sorted(glob.glob(os.path.join(log, "speed-mlx-*.json"))):
+    try:
+        data = json.load(open(p))
+    except Exception:
+        continue
+    for e in data.get("runs", []):
+        rows.append({"engine": "mlx", "name": data["name"], "depth": e["depth"],
+                     "prefill": e["prefill_tps"], "decode": e["decode_tps"]})
+
+rows.sort(key=lambda r: (r["depth"], r["engine"], r["name"]))
+print()
+print("%-6s %-42s %7s %10s %10s" % ("engine", "build", "depth", "prefill", "decode"))
+print("-" * 80)
+for r in rows:
+    print("%-6s %-42s %7d %10s %10s" % (
+        r["engine"], r["name"][-42:], r["depth"],
+        "%.1f" % r["prefill"] if r["prefill"] else "",
+        "%.2f" % r["decode"] if r["decode"] else ""))
+
+json.dump(rows, open(os.path.join(log, "speed.json"), "w"), indent=2)
+print()
+print("written to %s/speed.json" % log)
+
+a = os.path.join(log, "thermal-before.json")
+b = os.path.join(log, "thermal-after.json")
+if os.path.exists(a) and os.path.exists(b):
+    def tg(p):
+        for e in json.load(open(p)):
+            if e.get("n_gen", 0) > 0:
+                return e.get("avg_ts")
+        return None
+    x, y = tg(a), tg(b)
+    if x and y:
+        drift = 100.0 * (y - x) / x
+        print()
+        print("thermal check: first model %.2f then %.2f tok/s, drift %+.1f %%" % (x, y, drift))
+        if abs(drift) > 5:
+            print("more than 5 percent. The machine was heat limited, redo the session.")
+SPEEDREPEOF
+}
+
+
+# ------------------------------------------------------------------ quality
+
+# Writes the two python files this block needs. Kept as files on disk rather
+# than heredocs inside a pipeline, because a heredoc attached to the wrong end
+# of a pipe silently feeds the script to tee instead of to python.
+kld_install() {
+    mkdir -p $FROOT $LOG_DIR
+    cat > $FROOT/kld.py << 'KLDPYEOF'
+"""Per token KL divergence of a quantized MLX checkpoint against a reference.
+
+    python3 kld.py REF QUANT CORPUS CTX FIRST STEP OUT.json
+
+Follows llama.cpp's llama-perplexity --kl-divergence conventions so the numbers
+can sit in one table with GGUF numbers measured the same way:
+
+  the corpus is cut into independent chunks of CTX tokens, no cache carried
+  between them
+
+  inside each chunk only positions FIRST and later are scored, and llama.cpp
+  uses FIRST = CTX/2 so every scored token has at least half a context behind
+  it. Scoring from position zero counts tokens the model predicted almost
+  blind, which is where a quant looks worst, and makes every number pessimistic
+
+  the last position of a chunk has no target and is dropped
+
+  KLD is sum over the vocabulary of p*(log p - log q) with p from the
+  reference, so it is zero when the two agree
+
+  delta p is the change in the probability the model assigns to the token that
+  actually comes next, in percentage points, which is what llama.cpp reports
+
+Perplexity of both models is printed as well. That is the cross check: the
+reference perplexity here should match the reference perplexity llama.cpp
+reports on the same corpus at the same context. If it does, the two engines
+agree at full precision and quant against own-reference numbers are
+comparable across them. If it does not, the gap is the correction.
+"""
+
+import json
+import math
+import os
+import sys
+import time
+
+import mlx.core as mx
+from mlx_lm import load
+
+
+def logits_of(out):
+    return out.logits if hasattr(out, "logits") else out
+
+
+def main():
+    ref_path, qnt_path, corpus, ctx, first, step, out_json = sys.argv[1:8]
+    ctx, step = int(ctx), int(step)
+    first = int(first) if first else ctx // 2
+    same = os.path.realpath(ref_path) == os.path.realpath(qnt_path)
+
+    print("reference : %s" % ref_path, flush=True)
+    print("quant     : %s" % qnt_path, flush=True)
+    print("context   : %d, scoring from position %d" % (ctx, first), flush=True)
+    if same:
+        print("SELF TEST: reference against itself, expect 0 and 100 %", flush=True)
+
+    ref_model, tok = load(ref_path)
+    qnt_model = ref_model if same else load(qnt_path)[0]
+
+    ids = tok.encode(open(corpus, encoding="utf-8", errors="replace").read())
+    n_chunk = len(ids) // ctx
+    per_chunk = ctx - 1 - first
+    print("corpus    : %d tokens, %d chunks of %d, %d scored per chunk"
+          % (len(ids), n_chunk, ctx, per_chunk), flush=True)
+    if n_chunk < 1 or per_chunk < 1:
+        print("not enough text for one chunk at this context")
+        sys.exit(1)
+
+    klds = []
+    dp = []
+    nll_ref = 0.0
+    nll_qnt = 0.0
+    top1 = 0
+    scored = 0
+    t0 = time.time()
+
+    for c in range(n_chunk):
+        chunk = ids[c * ctx:(c + 1) * ctx]
+        x = mx.array([chunk])
+        lr = logits_of(ref_model(x))[0]
+        lq = lr if same else logits_of(qnt_model(x))[0]
+        mx.eval(lr, lq)
+
+        for s in range(first, ctx - 1, step):
+            e = min(s + step, ctx - 1)
+            a = lr[s:e].astype(mx.float32)
+            b = a if same else lq[s:e].astype(mx.float32)
+            logp = a - mx.logsumexp(a, axis=-1, keepdims=True)
+            logq = logp if same else b - mx.logsumexp(b, axis=-1, keepdims=True)
+            p = mx.exp(logp)
+            k = mx.sum(p * (logp - logq), axis=-1)
+
+            am_p = mx.argmax(a, axis=-1)
+            hits = mx.sum(am_p == (am_p if same else mx.argmax(b, axis=-1)))
+
+            tgt = mx.array(chunk[s + 1:e + 1])
+            rows = mx.arange(e - s)
+            lp_true = logp[rows, tgt]
+            lq_true = logq[rows, tgt]
+            d = (mx.exp(lq_true) - mx.exp(lp_true)) * 100.0
+
+            mx.eval(k, hits, lp_true, lq_true, d)
+            klds.extend(float(v) for v in k)
+            dp.extend(float(v) for v in d)
+            nll_ref += -float(mx.sum(lp_true))
+            nll_qnt += -float(mx.sum(lq_true))
+            top1 += int(hits)
+            scored += (e - s)
+
+        del lr
+        if not same:
+            del lq
+
+        if (c + 1) % 2 == 0 or c == n_chunk - 1:
+            el = time.time() - t0
+            eta = (n_chunk - c - 1) * el / (c + 1)
+            print("  chunk %d/%d   %.1f s each   eta %d min %02d s"
+                  % (c + 1, n_chunk, el / (c + 1), eta // 60, eta % 60), flush=True)
+
+    klds.sort()
+
+    def q(f):
+        return klds[min(len(klds) - 1, int(len(klds) * f))]
+
+    def rms(v):
+        return math.sqrt(sum(x * x for x in v) / len(v))
+
+    res = {
+        "reference": ref_path,
+        "quant": qnt_path,
+        "corpus": os.path.basename(corpus),
+        "context": ctx,
+        "score_from": first,
+        "chunks": n_chunk,
+        "tokens_scored": scored,
+        "reference_ppl": math.exp(nll_ref / scored),
+        "quant_ppl": math.exp(nll_qnt / scored),
+        "mean_kld": sum(klds) / len(klds),
+        "median_kld": q(0.50),
+        "p90_kld": q(0.90),
+        "p95_kld": q(0.95),
+        "p99_kld": q(0.99),
+        "max_kld": klds[-1],
+        "top1_agree_pct": 100.0 * top1 / scored,
+        "mean_delta_p_points": sum(dp) / len(dp),
+        "rms_delta_p_points": rms(dp),
+    }
+    json.dump(res, open(out_json, "w"), indent=2)
+
+    print()
+    print("tokens scored     : %d" % res["tokens_scored"])
+    print("reference ppl     : %.4f" % res["reference_ppl"])
+    print("quant ppl         : %.4f" % res["quant_ppl"])
+    print("mean KLD          : %.6f" % res["mean_kld"])
+    print("median KLD        : %.6f" % res["median_kld"])
+    print("90 / 95 / 99 pct  : %.6f  %.6f  %.6f"
+          % (res["p90_kld"], res["p95_kld"], res["p99_kld"]))
+    print("max KLD           : %.6f" % res["max_kld"])
+    print("same top-1        : %.3f %%" % res["top1_agree_pct"])
+    print("delta p, points   : mean %.4f   rms %.4f"
+          % (res["mean_delta_p_points"], res["rms_delta_p_points"]))
+    print()
+    if same:
+        ok = res["mean_kld"] < 1e-9 and res["top1_agree_pct"] > 99.999
+        print("SELF TEST %s" % ("PASSED" if ok else "FAILED, the script is wrong"))
+    else:
+        print("compare reference ppl against what llama.cpp reports for the")
+        print("same corpus at context %d. If they agree, the engines agree at" % ctx)
+        print("full precision and these numbers belong in the same table as")
+        print("the GGUF ones.")
+    print("written to %s" % out_json)
+
+
+if __name__ == "__main__":
+    main()
+KLDPYEOF
+
+    cat > $FROOT/speed_mlx.py << 'SPEEDPYEOF'
+"""MLX half of the speed protocol, timed to llama-bench's definitions.
+
+    python3 speed_mlx.py CHECKPOINT PROMPT GEN REPS "0 4096" OUT.json
+
+prefill: PROMPT tokens in one pass, tokens over seconds.
+decode : GEN single token passes reusing the cache, tokens over seconds.
+depth  : how much context is already in the cache before timing starts. Filling
+         it is setup and is not timed.
+
+A warmup pass runs first, because the first call compiles kernels and would
+otherwise be counted as the model being slow.
+"""
+
+import json
+import sys
+import time
+
+import mlx.core as mx
+from mlx_lm import load
+
+try:
+    from mlx_lm.models.cache import make_prompt_cache
+except Exception:
+    make_prompt_cache = None
+
+
+def logits_of(out):
+    return out.logits if hasattr(out, "logits") else out
+
+
+def one_depth(model, depth, prompt, gen, reps):
+    pre, dec = [], []
+    for _ in range(reps):
+        cache = make_prompt_cache(model) if make_prompt_cache else None
+        if depth > 0 and cache is not None:
+            mx.eval(logits_of(model(mx.array([[1] * depth]), cache=cache)))
+
+        x = mx.array([[1] * prompt])
+        t0 = time.perf_counter()
+        out = model(x, cache=cache) if cache is not None else model(x)
+        mx.eval(logits_of(out))
+        pre.append(prompt / (time.perf_counter() - t0))
+
+        if cache is None:
+            dec.append(float("nan"))
+            continue
+        tok = mx.array([[1]])
+        t0 = time.perf_counter()
+        for _ in range(gen):
+            mx.eval(logits_of(model(tok, cache=cache)))
+        dec.append(gen / (time.perf_counter() - t0))
+
+    pre.sort()
+    dec.sort()
+    return pre[len(pre) // 2], dec[len(dec) // 2]
+
+
+def main():
+    path, prompt, gen, reps, depths, out_json = sys.argv[1:7]
+    prompt, gen, reps = int(prompt), int(gen), int(reps)
+    depths = [int(d) for d in depths.split()]
+
+    name = path.rstrip("/").split("/")[-1]
+    model, _ = load(path)
+    mx.eval(logits_of(model(mx.array([[1] * 64]))))
+
+    runs = []
+    for d in depths:
+        print("  depth %d ..." % d, end="", flush=True)
+        try:
+            pp, tg = one_depth(model, d, prompt, gen, reps)
+        except Exception as e:
+            print(" failed: %s" % str(e).splitlines()[0][:70])
+            continue
+        print("  prefill %.1f   decode %.2f tok/s" % (pp, tg))
+        runs.append({"depth": d, "prefill_tps": pp, "decode_tps": tg})
+
+    json.dump({"name": name, "path": path, "engine": "mlx",
+               "prompt_tokens": prompt, "gen_tokens": gen, "reps": reps,
+               "runs": runs}, open(out_json, "w"), indent=2)
+    print("  written to %s" % out_json)
+
+
+if __name__ == "__main__":
+    main()
+SPEEDPYEOF
+    echo "wrote $FROOT/kld.py and $FROOT/speed_mlx.py"
+}
+
+# The first thing to run after kld_install. Measures the reference against
+# itself: a correct implementation gives exactly zero divergence and exactly
+# 100 percent agreement. Anything else means the script is wrong and no number
+# it produces is worth reading.
+mlx_kld_selftest() {
+    local ref="${1:-$MLX_REF}"
+    [ -d "$ref" ] || { echo "mlx_kld_selftest /path/to/reference"; return 1; }
+    kld_install > /dev/null
+    head -c 40000 "$MLX_EVAL" > /tmp/selftest-corpus.txt
+    echo "20 chunks on a slice, not the whole corpus"
+    echo "this checks tokenization, chunking, the scoring window and target"
+    echo "alignment. It does NOT check the divergence formula: with one model"
+    echo "the script short circuits. ppl_compare is what validates that."
+    python3 $FROOT/kld.py "$ref" "$ref" /tmp/selftest-corpus.txt 512 256 \
+        "$Q_STEP" "$LOG_DIR/selftest.json"
+}
+
+# mlx_kld2 CHECKPOINT
+# The corrected measurement: context 4096, second half scored, llama.cpp's
+# conventions. Replaces mlx_kld, whose numbers were pessimistic.
+mlx_kld2() {
+    local q="${1:-}"
+    if [ -z "$q" ] || [ ! -f "$q/config.json" ]; then
+        echo "mlx_kld2 /path/to/checkpoint"
+        ls -d $MLX_DIR/*/ 2>/dev/null | sed "s/^/   /"
+        return 1
+    fi
+    [ -z "$MLX_REF" ] && { echo "no reference. Run mlx_ref first."; return 1; }
+    [ -f "$MLX_EVAL" ] || { echo "no corpus at $MLX_EVAL"; return 1; }
+    kld_install > /dev/null
+    local name
+    name=$(basename "${q%/}")
+    mkdir -p $LOG_DIR
+    stdbuf -oL -eL python3 $FROOT/kld.py "$MLX_REF" "${q%/}" "$MLX_EVAL" \
+        "$Q_CTX" "$Q_FIRST" "$Q_STEP" "$LOG_DIR/kld2-$name.json" \
+        2>&1 | tee "$LOG_DIR/kld2-$name.log"
+    autopush "$LOG_DIR/kld2-$name.json" "logs/kld2-$name.json"
+    autopush "$LOG_DIR/kld2-$name.log" "logs/kld2-$name.log"
+}
+
+mlx_kld2_all() {
+    [ -z "$MLX_REF" ] && { echo "no reference. Run mlx_ref first."; return 1; }
+    local d name n=0 todo=""
+    for d in $MLX_DIR/*/; do
+        [ -f "$d/config.json" ] || continue
+        name=$(basename "${d%/}")
+        case "$name" in *probe*|*bf16*) continue ;; esac
+        [ -f "$LOG_DIR/kld2-$name.json" ] && [ "$KLD_FORCE" != "1" ] \
+            && { echo "already measured: $name"; continue; }
+        todo="$todo $d"
+    done
+    [ -z "$todo" ] && { echo "nothing left"; mlx_results2; return 0; }
+    for d in $todo; do
+        n=$(( n + 1 ))
+        echo; echo "########## $n of $(echo $todo | wc -w) ##########"
+        mlx_kld2 "${d%/}"
+    done
+    mlx_results2
+}
+
+mlx_results2() {
+    python3 - "$MLX_DIR" "$LOG_DIR" << 'RES2EOF'
+import glob, json, os, sys
+root, log = sys.argv[1], sys.argv[2]
+rows = []
+for p in sorted(glob.glob(os.path.join(log, "kld2-*.json"))):
+    try:
+        r = json.load(open(p))
+    except Exception:
+        continue
+    name = os.path.basename(p)[len("kld2-"):-len(".json")]
+    d = os.path.join(root, name)
+    size = 0
+    if os.path.isdir(d):
+        size = sum(os.path.getsize(f) for f in glob.glob(os.path.join(d, "*.safetensors")))
+    r["name"] = name
+    r["size_gb"] = round(size / 1e9, 2) if size else None
+    rows.append(r)
+rows.sort(key=lambda r: r.get("size_gb") or 0)
+json.dump(rows, open(os.path.join(log, "mlx-results2.json"), "w"), indent=2)
+print("%-42s %8s %11s %10s %9s" % ("build", "GB", "mean KLD", "top-1 %", "ppl"))
+for r in rows:
+    print("%-42s %8s %11s %10s %9s" % (
+        r["name"][-42:], r.get("size_gb", ""),
+        round(r["mean_kld"], 6), round(r["top1_agree_pct"], 3),
+        round(r["quant_ppl"], 4)))
+print()
+if rows:
+    print("reference: %s, ppl %.4f, context %d, scored from %d, %d chunks"
+          % (rows[0]["reference"], rows[0]["reference_ppl"], rows[0]["context"],
+             rows[0]["score_from"], rows[0]["chunks"]))
+RES2EOF
+}
+
+
+# ------------------------------------------------------------------ calibration
+
+# The one experiment that makes GGUF and MLX numbers comparable at all.
+#
+# Both engines run the SAME original weights at full precision on the SAME
+# corpus at the SAME context, and we compare perplexity. If they agree, their
+# kernels agree where it matters and each engine's quant-against-own-reference
+# numbers belong in one table. If they disagree, the gap is a correction that
+# has to be stated rather than ignored.
+#
+# The GGUF side of this number is already published: 4.5219 plus or minus
+# 0.0238 at context 4096 on eval_neutral.
+ppl_compare() {
+    echo "=============== what we are comparing ==============="
+    echo "the same weights, unquantized, in two engines, same corpus, same"
+    echo "context. Not two quants: two references."
+    echo
+    echo "GGUF side, already measured and published:"
+    echo "  reference ppl 4.5219 +/- 0.0238   context 4096   87 chunks"
+    echo
+    echo "MLX side, run it now:"
+    echo
+    if [ -z "$MLX_REF" ]; then
+        echo "  set the bf16 checkpoint first:  mlx_ref /mlx/<stem>-MLX-bf16"
+        return 1
+    fi
+    kld_install > /dev/null
+    stdbuf -oL -eL python3 $FROOT/kld.py "$MLX_REF" "$MLX_REF" "$MLX_EVAL" \
+        "$Q_CTX" "$Q_FIRST" "$Q_STEP" "$LOG_DIR/ppl-mlx-bf16.json" \
+        2>&1 | tee "$LOG_DIR/ppl-mlx-bf16.log"
+    echo
+    echo "to redo the GGUF side on this box for a like for like check:"
+    echo "  $BIN/llama-perplexity -m <bf16>.gguf -f $MLX_EVAL -c $Q_CTX -ngl 99"
+    echo
+    echo "reading the result: within about one percent means the engines agree"
+    echo "and the two ladders can share a table. A larger gap is a correction"
+    echo "that goes in the methodology section, not something to hide."
+}
+
+
+help_measure() {
+cat << 'HELPMEOF'
+
+MAC, FROM NOTHING
+  mac_setup            xcode tools, brew, cmake, python packages
+  mac_build            llama.cpp with Metal
+  mac_memory           how much of unified memory the GPU may actually use
+  mac_get gguf|mlx|eval|all
+  mac_info             chip, memory, library versions, written to the log
+
+SPEED, BOTH ENGINES, ONE PROTOCOL
+  speed_note           what the settings mean and why
+  speed_gguf FILE | speed_mlx DIR | speed_all | speed_report
+  SPEED_PROMPT=512 SPEED_GEN=128 SPEED_DEPTHS="0 4096 16384" SPEED_REPS=5
+
+QUALITY, llama.cpp CONVENTIONS
+  kld_install          writes kld.py and speed_mlx.py to disk
+  mlx_kld_selftest     reference against itself, must give 0 and 100 percent
+  mlx_kld2 DIR | mlx_kld2_all | mlx_results2
+  Q_CTX=4096 Q_FIRST=(ctx/2) Q_STEP=64
+
+CROSS ENGINE
+  ppl_compare          full precision perplexity in both engines, same corpus
+
+ORDER
+
+  on the Mac:
+    mac_setup ; mac_build ; mac_memory ; mac_get all
+    speed_note ; speed_all
+
+  on the rented box:
+    kld_install ; mlx_kld_selftest        <- read PASSED before anything else
+    ppl_compare                           <- against the published 4.5219
+    mlx_ref /mlx/<stem>-MLX-bf16
+    mlx_kld2_all ; mlx_results2
+
+HELPMEOF
+}
+
+
+# ================================================================== ADDENDUM
+#
+# Append this after the MEASURE block. Three gaps it closes:
+#
+#   nothing built the MLX reference, it was a raw command typed by hand
+#   nothing downloaded our published MLX ladder onto a Linux box
+#   nothing downloaded other publishers' MLX builds
+#
+# It also redefines save_state. A later definition of a shell function wins, so
+# no edit to the original is needed: the version below simply replaces it from
+# the point this file is sourced. It writes everything the old one wrote plus
+# the variables the MLX and measurement work depends on, which otherwise vanish
+# in a fresh tmux pane.
+
+save_state() {
+    cat > $STATE << STATEEOF
+MAIN=$MAIN
+RECIPE=$RECIPE
+METRICS=$METRICS
+METRICS_KIND=$METRICS_KIND
+UPSTREAM=$UPSTREAM
+EVALSET=$EVALSET
+EVAL=$EVAL
+BASE=$BASE
+CTX=$CTX
+IM_TOKENS_EXACT=$IM_TOKENS_EXACT
+IM_MODEL=$IM_MODEL
+IM_CORPUS=$IM_CORPUS
+IM_CTX=$IM_CTX
+GPUS=$GPUS
+AUTOPUSH=$AUTOPUSH
+INCLUDE_EXPERIMENTAL=$INCLUDE_EXPERIMENTAL
+MLX_REF=$MLX_REF
+MLX_EVAL=$MLX_EVAL
+MLX_SRC=$MLX_SRC
+MLXROOT=$MLXROOT
+MLX_DIR=$MLX_DIR
+Q_CTX=$Q_CTX
+Q_FIRST=$Q_FIRST
+Q_STEP=$Q_STEP
+STATEEOF
+}
+
+# The build function takes a CUDA architecture number and getting it wrong
+# produces a binary that runs on nothing. It is not guessable from the card
+# name: H100 and H200 are both 90, RTX 5090 is 120, B200 is 100. Read it off
+# the card instead of remembering.
+cuda_arch() {
+    local cap
+    cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
+    if [ -z "$cap" ]; then
+        echo "no nvidia-smi, cannot tell"
+        return 1
+    fi
+    local arch
+    arch=$(echo "$cap" | tr -d '.')
+    echo "compute capability $cap on $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+    echo "build with:  build $arch"
+}
+
+# What the box has to hold before anything starts. Running out of disk halfway
+# through a 210 GB download is a wasted hour, and vast bills for the hour.
+disk_plan() {
+    echo "what this job needs on disk:"
+    echo "  /src        original weights                          56 GB"
+    echo "  MLX bf16    the reference checkpoint                   51 GB"
+    echo "  GGUF bf16   the other engine's reference               51 GB"
+    echo "  our MLX     six rungs                                 119 GB"
+    echo "  external    fourteen community builds                 210 GB"
+    echo "  ------------------------------------------------------------"
+    echo "  total                                            about 490 GB"
+    echo
+    echo "plus the hub cache, which can hold a second copy of anything"
+    echo "downloaded without --local-dir. Take 1 TB minimum, 2 TB comfortably."
+    echo
+    df -h / | tail -1
+    echo
+    echo "HF_HOME is $HF_HOME. If space runs short mid-job:  rm -rf $HF_HOME/*"
+}
+
+
+# ------------------------------------------------------------------ reference
+
+# The unquantized MLX checkpoint every measurement is taken against. Not a
+# build for use: it is 51 GB and exists so that divergence has a fixed zero.
+#
+# Conversion with no quantization flag is a format change, not arithmetic, so
+# this reproduces byte for byte anywhere. That is what makes it publishable as
+# a shared point of comparison.
+mlx_reference() {
+    mlx_need || return 1
+    local out
+    out=$(mlx_out bf16)
+    if [ -d "$out" ] && ls "$out"/*.safetensors > /dev/null 2>&1; then
+        echo "already here: $out  $(du -sh $out | cut -f1)"
+        mlx_ref "$out"
+        return 0
+    fi
+    if [ ! -d "$MLX_SRC" ] || ! ls $MLX_SRC/*.safetensors > /dev/null 2>&1; then
+        echo "no original weights at $MLX_SRC. Run mlx_src first."
+        return 1
+    fi
+    echo "converting $MLX_SRC to an MLX checkpoint with no quantization"
+    echo "target: $out, about 51 GB"
+    date
+    local start
+    start=$(date +%s)
+    stdbuf -oL -eL mlx_vlm.convert --hf-path "$MLX_SRC" --mlx-path "$out" \
+        --dtype bfloat16 2>&1 | tee "$LOG_DIR/mlx-reference.log"
+    echo "took $(( $(date +%s) - start )) seconds"
+    mlx_inspect "$out"
+    echo
+    mlx_ref "$out"
+    save_state
+}
+
+
+# ------------------------------------------------------------------ our builds
+
+# Pull our own published MLX ladder onto this box, one directory per rung.
+OUR_MLX=${OUR_MLX:-"mixed_3_4 4bit mixed_4_6 5bit 6bit 8bit"}
+
+mlx_get_ours() {
+    mlx_need || return 1
+    mkdir -p $MLX_DIR
+    local r repo dest n=0
+    for r in $OUR_MLX; do
+        n=$(( n + 1 ))
+        repo=$(mlx_repo "$r")
+        dest=$MLX_DIR/$(mlx_stem)-MLX-$r
+        echo
+        echo "########## $n: $repo ##########"
+        if [ -f "$dest/config.json" ]; then
+            echo "already here, $(du -sh $dest | cut -f1)"
+            continue
+        fi
+        hf download "$repo" --local-dir "$dest" || echo "  FAILED"
+        du -sh "$dest" 2>/dev/null
+    done
+    echo
+    du -sh $MLX_DIR
+}
+
+
+# ------------------------------------------------------------------ external
+
+# Other publishers' MLX builds, measured here against our reference. Their
+# published figures were taken against their own reference and harness, so
+# they cannot go in a table with ours. Their files can.
+#
+# The list is only builds that keep the vision tower and are in the size range
+# where the argument is. Text only builds are excluded on purpose: they are
+# smaller for free because they drop a 0.92 GB tower, and putting them on a
+# size axis next to a build that carries one is a comparison of two different
+# things.
+#
+# Each lands flat as ext--<publisher>--<name>, so the publisher is in every log
+# name and the existing measurement loop picks them up without recursing.
+EXTERNAL_MLX=${EXTERNAL_MLX:-"
+lukaskremla/Qwen3.8-27B-2bit-MLX
+mlx-works/Qwen3.8-27B-oQ2e-mtp
+lukaskremla/Qwen3.8-27B-3bit-MLX
+leonsarmiento/Qwen3.8-27B-3bit-mtp-mlx
+maglun/Qwen3.8-27B-MLX-Mixed-3.80bpw
+mlx-works/Qwen3.8-27B-oQ3e-mtp
+rapid-mlx/Qwen3.8-27B-mixed-3.5bpw-MLX
+mlx-community/Qwen3.8-27B-mxfp4
+mlx-community/Qwen3.8-27B-4bit
+WaveCut/Qwen3.8-27B-MLX-4bit-DWQ
+mlx-community/Qwen3.8-27B-oQ4
+True2456/Qwen3.8-27B-AWQ-4.85bpw
+mlx-community/Qwen3.8-27B-OptiQ-4bit
+"}
+
+mlx_ext_list() {
+    local r n=0
+    echo "these get downloaded by mlx_get_external:"
+    for r in $EXTERNAL_MLX; do
+        n=$(( n + 1 ))
+        printf "  %2d  %s\n" $n "$r"
+    done
+    echo
+    echo "about 210 GB total. Edit EXTERNAL_MLX to change the list."
+}
+
+mlx_get_external() {
+    mkdir -p $MLX_DIR
+    local r pub name dest n=0 total
+    total=$(echo $EXTERNAL_MLX | wc -w)
+    for r in $EXTERNAL_MLX; do
+        n=$(( n + 1 ))
+        pub=$(echo "$r" | cut -d/ -f1)
+        name=$(echo "$r" | cut -d/ -f2)
+        dest=$MLX_DIR/ext--$pub--$name
+        echo
+        echo "########## $n of $total: $r ##########"
+        if [ -f "$dest/config.json" ]; then
+            echo "already here, $(du -sh $dest | cut -f1)"
+            continue
+        fi
+        hf download "$r" --local-dir "$dest" || { echo "  FAILED"; continue; }
+        du -sh "$dest"
+    done
+    echo
+    echo "on disk now:"
+    du -sh $MLX_DIR/ext--* 2>/dev/null
+    echo
+    echo "measure them with the same command as ours:  mlx_kld2_all"
+}
+
+# What is downloaded, what is measured, and what is neither.
+mlx_audit() {
+    local d name have=0 done_=0 miss=""
+    for d in $MLX_DIR/*/; do
+        [ -f "$d/config.json" ] || continue
+        name=$(basename "${d%/}")
+        case "$name" in *probe*|*bf16*) continue ;; esac
+        have=$(( have + 1 ))
+        if [ -f "$LOG_DIR/kld2-$name.json" ]; then
+            done_=$(( done_ + 1 ))
+        else
+            miss="$miss $name"
+        fi
+    done
+    echo "checkpoints on disk : $have"
+    echo "measured            : $done_"
+    if [ -n "$miss" ]; then
+        echo "not measured yet:"
+        for name in $miss; do echo "   $name"; done
+        echo
+        echo "run:  mlx_kld2_all"
+    fi
+    echo
+    echo "reference           : ${MLX_REF:-NOT SET, run mlx_reference}"
+    echo "corpus              : $MLX_EVAL"
+    echo "context             : $Q_CTX, scoring from ${Q_FIRST:-half of it}"
+}
+
 
 # ================================================================== state
 # Read back whatever the last pane set, so a fresh tmux tab is not amnesiac.
