@@ -10,7 +10,7 @@
 # checks its inputs, and stops loudly when something is missing.
 
 # Bump this on every change. reload compares it against what is on github.
-FOUNDRY_VERSION=2026-08-21.02
+FOUNDRY_VERSION=2026-08-21.03
 
 # ------------------------------------------------------------------ settings
 # These live here and nowhere else. An earlier edit lost them, which left BIN,
@@ -6185,7 +6185,7 @@ mlx_get_ours() {
 #
 # Each lands flat as ext--<publisher>--<name>, so the publisher is in every log
 # name and the existing measurement loop picks them up without recursing.
-EXTERNAL_MLX=${EXTERNAL_MLX:-"
+EXTERNAL_MLX="
 lukaskremla/Qwen3.8-27B-2bit-MLX
 mlx-works/Qwen3.8-27B-oQ2e-mtp
 lukaskremla/Qwen3.8-27B-3bit-MLX
@@ -6199,7 +6199,7 @@ WaveCut/Qwen3.8-27B-MLX-4bit-DWQ
 mlx-community/Qwen3.8-27B-oQ4
 True2456/Qwen3.8-27B-AWQ-4.85bpw
 mlx-community/Qwen3.8-27B-OptiQ-4bit
-"}
+"
 
 mlx_ext_list() {
     local r n=0
