@@ -28,7 +28,7 @@
 # Two methods are used and nothing else. Both are explained where they are
 # defined. mlx3_plan prints the arithmetic behind every expected number.
 
-MLX3_VERSION=2026-08-24.01
+MLX3_VERSION=2026-08-24.02
 
 MLX3_UP=${MLX3_UP:-Qwen/Qwen3.8-27B}
 MLX3_ORG=${MLX3_ORG:-AtomicChat}
@@ -1547,116 +1547,135 @@ PLANEOF
 
 mlx3_box() {
     case "${1:-}" in
-    a)
-cat << 'BOXAEOF'
+    hub)
+cat << 'BOXHEOF'
 
-BOX A, H200, reference and clipping. No /src, no teacher, starts fastest.
-Job: build the reference cache, settle what counts as a result, re-round the
-two published rungs, measure them.
+BOX 1, the hub. RTX PRO 6000 if the Blackwell check passed, otherwise an H200.
+Rent this one FIRST. Everything it does is bound by disk and by a single
+forward pass, so the cheap card costs minutes, not results.
 
+Job: build the 3 bit rung, re-round both rungs, publish the bases the second
+box needs, settle what counts as a result, measure what clipping alone bought.
+
+  export HF_TOKEN=hf_...
+  curl -sL https://raw.githubusercontent.com/worthant/quantizer/main/foundry-mlx3.sh -o /mlx3.sh
+  source /mlx3.sh
+  mlx3_setup
+  mlx3_check                      <- READ THIS BEFORE ANYTHING ELSE
+
+  Tens of thousands of GFLOP/s means the CUDA backend has kernels for this
+  card and the B200 is safe too. A few hundred means it fell back to the
+  processor: kill the instance and run the whole plan on two H200 instead.
+  H200 is sm_90 and always works. Both Blackwell parts are new silicon
+  against the youngest part of the MLX stack.
+
+  mlx3_persist
+  mlx3_get src
   mlx3_get ref
   mlx3_get eval
   mlx3_get base 4bit
-  mlx3_get base mixed_3_4
-  mlx3_cache
   mlx3_verify
-  mlx3_repeat /mlx/Qwen3.8-27B-MLX-4bit
+  mlx3_quant 3 64
+  mlx3_clip /mlx/Qwen3.8-27B-MLX-3bit
+  mlx3_push /mlx/Qwen3.8-27B-MLX-3bit-CLIP 3bit-CLIP
   mlx3_clip /mlx/Qwen3.8-27B-MLX-4bit
-  mlx3_kld  /mlx/Qwen3.8-27B-MLX-4bit-CLIP
-  mlx3_clip /mlx/Qwen3.8-27B-MLX-mixed_3_4
-  mlx3_kld  /mlx/Qwen3.8-27B-MLX-mixed_3_4-CLIP
+  mlx3_push /mlx/Qwen3.8-27B-MLX-4bit-CLIP 4bit-CLIP
+  mlx3_cache
+  mlx3_repeat /mlx/Qwen3.8-27B-MLX-4bit
+  mlx3_kld /mlx/Qwen3.8-27B-MLX-3bit-CLIP
+  mlx3_kld /mlx/Qwen3.8-27B-MLX-4bit-CLIP
   mlx3_table
 
-Checkpoints along the way:
+The order is deliberate. The 3 bit base is published first because it is the
+main bet and box 2 is waiting on it. The reference cache and the measurements
+come after, because nothing is waiting on them.
 
-  mlx3_cache    24.4 GB written, 24 chunks
+Checkpoints:
+
+  mlx3_check    tens of thousands of GFLOP/s, or move to H200
+  mlx3_clip     the printed squared error drop, before any measurement. Under
+                two percent at 4 bits means clipping has nothing there and the
+                4 bit lane on box 2 is not worth its minutes
   mlx3_repeat   the two passes agree to every digit, or you now have a noise
                 floor and it belongs next to every number in the card
-  mlx3_clip     the printed squared error drop, before any measurement. Under
-                two percent at 4 bits means the method has nothing at 4 bits:
-                tell box C to stop and put its hours on the 3 bit lane
   mlx3_kld      4bit-CLIP under 0.053775 at exactly 16.05 GB
-                mixed_3_4-CLIP under 0.154161 at 13.37 GB, which also wins by
-                a third of a gigabyte
+                3bit-CLIP under 0.154161 at 12.70 GB, a full gigabyte lighter
+                than the build it beats
 
-BOXAEOF
+BOXHEOF
         ;;
-    b)
-cat << 'BOXBEOF'
+    dwq)
+cat << 'BOXDEOF'
 
-BOX B, H200, the low end lane. This is the main bet: damage at 3 bits is four
-times larger than at 4, and both methods pay in proportion to damage.
-Job: build a plain 3 bit rung, re-round it, distil it, measure.
+BOX 2, distillation. B200 if the Blackwell check on box 1 passed, otherwise a
+second H200. Rent it about FIFTEEN MINUTES after box 1, not at the same time:
+it needs that long to pull its own 82 GB, and by then the first base is on the
+hub. Renting it earlier is paying for an idle card.
 
-  mlx3_get src
+One box runs BOTH lanes one after the other. On a B200 a 600 step run is about
+eight minutes, so two lanes plus their measurements fit in well under an hour,
+which is cheaper than two expensive boxes in parallel.
+
+  export HF_TOKEN=hf_...
+  curl -sL https://raw.githubusercontent.com/worthant/quantizer/main/foundry-mlx3.sh -o /mlx3.sh
+  source /mlx3.sh
+  mlx3_setup
+  mlx3_check
+  mlx3_persist
   mlx3_get ref
   mlx3_get teacher
   mlx3_get eval
   mlx3_get calib
   mlx3_cache
-  mlx3_quant 3 64
-  mlx3_clip /mlx/Qwen3.8-27B-MLX-3bit
   mlx3_data
-  mlx3_mem 3 64 2048
   mlx3_dwq_help
+
+Then the low end lane, which is the main bet:
+
+  mlx3_get base 3bit-CLIP
+  mlx3_mem 3 64 2048
   mlx3_dwq 3 64 /mlx/Qwen3.8-27B-MLX-3bit-CLIP
   mlx3_kld /mlx/Qwen3.8-27B-MLX-3bit-CLIP-DWQ
   mlx3_table
 
-Why a plain 3 bit and not the published mixed_3_4: distillation needs a uniform
-base. A mixed layout carries per tensor bits and group sizes, and passing
---bits on top of it is undefined. mixed_3_4 gets clipped on box A and
-published, it does not get distilled.
+Then the 4 bit lane, unless box 1 reported under two percent from clipping
+there:
 
-Checkpoints along the way:
-
-  mlx3_quant    12.70 GB on disk
-  mlx3_clip     squared error drop around 15 to 21 percent
-  mlx3_dwq      validation loss falls by more than a third over the run. Under
-                15 percent means the rate is wrong, not the method: halve it if
-                the loss oscillates, triple it if it crawls
-  mlx3_kld      under 0.140 at 12.70 GB beats the 13.70 GB target and is a
-                gigabyte lighter as well
-
-BOXBEOF
-        ;;
-    c)
-cat << 'BOXCEOF'
-
-BOX C, H200, the 4 bit lane. Start it only after box A reports the clipping
-number: if clipping moves 4 bits by less than two percent, this box is not
-worth renting and its hours belong to box B.
-
-  mlx3_get ref
-  mlx3_get teacher
-  mlx3_get base 4bit
-  mlx3_get eval
-  mlx3_get calib
-  mlx3_cache
-  mlx3_clip /mlx/Qwen3.8-27B-MLX-4bit
-  mlx3_data
-  mlx3_mem 4 64 2048
+  mlx3_get base 4bit-CLIP
   mlx3_dwq 4 64 /mlx/Qwen3.8-27B-MLX-4bit-CLIP
   mlx3_kld /mlx/Qwen3.8-27B-MLX-4bit-CLIP-DWQ
   mlx3_table
 
-Why H200 and not the 96 GB card. Run mlx3_mem 4 64 2048: the estimate is about
-69 GB, which does fit in 96 with room, but the estimate does not include
-allocator fragmentation or the graph cache, and there is no second chance in a
-two hour window. The 96 GB card is the right machine for clipping and
-measurement, where nothing exceeds a couple of gigabytes over the model itself.
+If there are minutes left, the group 32 variant. Twice as many tunable scales,
+14.38 GB, which is above the 13.70 target but lands in the size class where
+the best foreign build is 0.180793. It needs 83 GB, so a B200 or an H200 only:
 
-Checkpoint:
+  mlx3_get src
+  mlx3_quant 3 32
+  mlx3_clip /mlx/Qwen3.8-27B-MLX-3bit-g32
+  mlx3_dwq 3 32 /mlx/Qwen3.8-27B-MLX-3bit-g32-CLIP
+  mlx3_kld /mlx/Qwen3.8-27B-MLX-3bit-g32-CLIP-DWQ
 
-  mlx3_kld      under 0.053775 at exactly 16.05 GB
+Checkpoints:
 
-BOXCEOF
+  mlx3_dwq      validation loss falls by more than a third over the run. Under
+                15 percent means the rate is wrong, not the method: halve it
+                if the loss oscillates, triple it if it crawls
+  mlx3_kld      under 0.140 at 12.70 GB beats the 13.70 GB target and is a
+                gigabyte lighter as well
+
+BOXDEOF
         ;;
     *)
-        echo "mlx3_box a | b | c"
-        echo "  a  reference, checks, clipping, measuring"
-        echo "  b  3 bit lane: build, clip, distil       <- the main bet"
-        echo "  c  4 bit lane: clip, distil"
+        echo "mlx3_box hub | dwq"
+        echo "  hub  build, clip, verify, measure     rent first, cheap card"
+        echo "  dwq  both distillation lanes          rent 15 minutes later"
+        echo
+        echo "cards, in order of what this workload actually needs:"
+        echo "  B200            2.25 PFLOPS bf16, 180 GB   both lanes, ~8 min a run"
+        echo "  H200 SXM         990 TFLOPS,      141 GB   ~17 min a run"
+        echo "  H200 NVL         835 TFLOPS,      141 GB   no reason to prefer it"
+        echo "  RTX PRO 6000  200-250 TFLOPS,      96 GB   the hub, half the price"
         ;;
     esac
 }
@@ -1676,7 +1695,7 @@ DISTILL   mlx3_mem BITS GROUP SEQ        memory before renting
           mlx3_dwq BITS GROUP BASE [TEACHER] [SEQ] [LR] [SAMPLES]
 VISION    mlx3_reattach TEXT VISION OUT
 PUBLISH   mlx3_push DIR LABEL
-PLAN      mlx3_plan | mlx3_box a | mlx3_box b | mlx3_box c
+PLAN      mlx3_plan | mlx3_box hub | mlx3_box dwq
 
 FROM NOTHING, ON A FRESH BOX
 
@@ -1685,7 +1704,7 @@ FROM NOTHING, ON A FRESH BOX
   source /mlx3.sh
   mlx3_setup
   mlx3_persist
-  mlx3_box b            then paste its lines one at a time
+  mlx3_box hub          then paste its lines one at a time
 
 H3EOF
     echo "  running $MLX3_VERSION"
