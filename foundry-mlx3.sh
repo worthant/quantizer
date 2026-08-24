@@ -28,7 +28,7 @@
 # Two methods are used and nothing else. Both are explained where they are
 # defined. mlx3_plan prints the arithmetic behind every expected number.
 
-MLX3_VERSION=2026-08-24.04
+MLX3_VERSION=2026-08-24.06
 
 MLX3_UP=${MLX3_UP:-Qwen/Qwen3.8-27B}
 MLX3_ORG=${MLX3_ORG:-AtomicChat}
@@ -63,7 +63,7 @@ MLX3_ALPHAS=${MLX3_ALPHAS:-"1.000 0.995 0.985 0.970 0.955 0.940 0.920 0.900 0.88
 # Distillation defaults, taken from published runs rather than from what fits
 # in the least memory. See the comment above mlx3_dwq.
 MLX3_DATA=${MLX3_DATA:-/dwq-data}
-MLX3_CHARS=${MLX3_CHARS:-9000}
+MLX3_CHARS=${MLX3_CHARS:-0}   # 0 means measure it, see mlx3_data
 MLX3_TRAIN=${MLX3_TRAIN:-600}
 MLX3_VALID=${MLX3_VALID:-60}
 MLX3_SEQ=${MLX3_SEQ:-2048}
@@ -189,38 +189,50 @@ CHKEOF
 # has nothing to do with the card. So: warm up first, hold every result alive,
 # evaluate once.
 mlx3_bench() {
-    python3 - << 'BENCHEOF'
-import time
+    python3 - "${1:-8192}" << 'BENCHEOF'
+import sys, time
 import mlx.core as mx
 
-print("device: %s" % mx.default_device())
-print()
-print("%-10s %8s %14s" % ("dtype", "size", "TFLOP/s"))
+cap = int(sys.argv[1])
+sizes = [n for n in (4096, 8192, 12288) if n <= cap]
+
+print("device: %s" % mx.default_device(), flush=True)
+print(flush=True)
+print("%-10s %8s %14s" % ("dtype", "size", "TFLOP/s"), flush=True)
 for dt, name in ((mx.bfloat16, "bfloat16"), (mx.float32, "float32")):
-    for n in (4096, 8192):
+    for n in sizes:
         a = mx.random.normal((n, n)).astype(dt)
         b = mx.random.normal((n, n)).astype(dt)
         mx.eval(a, b)
-        mx.eval(a @ b)                       # warm up, compiles the kernel
-        reps = 20
+        c = a @ b
+        mx.eval(c)                       # warm up, compiles the kernel
+        del c
+        reps = 20 if n <= 8192 else 8
         t = time.perf_counter()
-        outs = [a @ b for _ in range(reps)]  # held alive, so all of them run
-        mx.eval(*outs)
-        dt_s = time.perf_counter() - t
-        tf = reps * 2 * n ** 3 / dt_s / 1e12
-        print("%-10s %8d %14.1f" % (name, n, tf))
-        del a, b, outs
-print()
+        for _ in range(reps):
+            c = a @ b
+            mx.eval(c)                   # one at a time: no giant graph to capture
+            del c
+        el = time.perf_counter() - t
+        print("%-10s %8d %14.1f" % (name, n, reps * 2 * n ** 3 / el / 1e12), flush=True)
+        del a, b
+print(flush=True)
 print("what the bfloat16 8192 row should look like, dense tensor core peak:")
 print("  B200           2250 TFLOP/s peak, expect 1200 or more")
 print("  H200 SXM        990 peak, expect 550 or more")
-print("  H100 NVL        835 peak, expect 450 or more")
+print("  H100 NVL        835 peak, expect 450 or more   (measured: 459.8)")
 print("  RTX PRO 6000    200-250 peak, expect 120 or more")
 print()
-print("Tens instead of hundreds means MLX is not using the tensor cores on")
-print("this card. Distillation would then take roughly ten times the estimate")
-print("and the whole schedule has to be redrawn, so read this before renting")
-print("anything else.")
+print("Tens instead of hundreds means the tensor cores are not being used and")
+print("distillation would take roughly ten times the estimate.")
+print()
+print("If a row never prints, that size is where the backend stalls. Bisect it")
+print("with mlx3_bench 4096 and mlx3_bench 8192, and check the driver version:")
+print("the mlx[cuda13] wheel needs 580 or newer. A process at 100 percent of")
+print("one core with nothing happening on the card is host side work, either")
+print("kernel compilation or graph capture, not the card being slow. Try")
+print("MLX_CUDA_GRAPH_CACHE_SIZE=1 mlx3_bench before spending time on it, and")
+print("if that does not clear it, move the job to an sm_90 card and go on.")
 BENCHEOF
 }
 
@@ -464,6 +476,17 @@ for gb, kld, who in targets:
     print("  %5.2f GB  %.6f  %-18s  ours %.6f at %.2f GB -> %s"
           % (gb, kld, who, best["mean_kld"], best["gb"], verdict))
 print()
+try:
+    a = json.load(open(os.path.join(log, "repeat-1.json")))
+    b = json.load(open(os.path.join(log, "repeat-2.json")))
+    d = 100.0 * abs(b["mean_kld"] - a["mean_kld"]) / a["mean_kld"]
+    print("noise floor measured on this box: %.4f percent, from two passes of" % d)
+    print("one checkpoint against the same cached reference. It is one")
+    print("difference and not a distribution, so treat about three times it as")
+    print("the smallest defensible gap and print it beside every number.")
+except Exception:
+    print("noise floor not measured on this box yet: mlx3_repeat DIR")
+print()
 TBLEOF
 }
 
@@ -641,10 +664,13 @@ else:
         print("%-40s %12.6f %12.6f %+9.3f %%" % (n[-40:], a, b, 100.0 * (b - a) / a))
     print()
     print("llama.cpp drops vocabulary entries whose reference probability is")
-    print("below e^-16, about one in ten million. Those entries still carry")
-    print("p*(log p - log q), and a quant that pushes an already improbable")
-    print("token further down makes that term positive, so the whole vocabulary")
-    print("sum is normally the larger of the two.")
+    print("below e^-16, about one in ten million. Measured on this model, the")
+    print("whole vocabulary sum is the SMALLER of the two by about 0.18 percent,")
+    print("consistently. Those tail terms are p*(log p - log q) with q above p:")
+    print("quantization smooths the distribution and lifts the floor under")
+    print("improbable tokens, so the tail contributes negative terms and cutting")
+    print("it off raises the number. The total is still non negative, only the")
+    print("individual terms can be negative.")
     print()
     print("It only matters when one of our numbers sits next to a llama.cpp")
     print("number. Inside our own table every build used the same setting, so")
@@ -829,41 +855,97 @@ print("flat and it will not grow.")
 MEMEOF
 }
 
-# Calibration records. A 3000 character record is about 750 tokens, so asking
-# for a 2048 token window gets 750 and the setting silently does nothing.
-# 9000 characters is about 2250 tokens, which fills it.
+# Calibration records, sized against the real tokenizer instead of a guess.
+#
+# This bit already cost a run. Records of 9000 characters are about 2250 tokens,
+# and mlx-lm's loader does not truncate a sequence longer than max_seq_length,
+# it drops it. Every record was longer than the 2048 window, every record was
+# dropped, and the validation set came out empty:
+#
+#   Generating validation split: 60 examples
+#   ValueError: Dataset must have at least batch_size=1 examples but only has 0
+#
+# So the length is now measured rather than assumed: tokenize a slice of the
+# corpus, get the real characters per token, size the records to 90 percent of
+# the window, then tokenize twenty of them and print what actually came out.
+#
+#   mlx3_data              sizes for MLX3_SEQ, currently 2048
+#   mlx3_data 4096         sizes for a 4096 window
 mlx3_data() {
     if [ ! -f "$MLX3_CALIB" ]; then
         echo "no calibration text at $MLX3_CALIB. Run:  mlx3_get calib"
         return 1
     fi
+    local target="${1:-$MLX3_SEQ}"
+    local tokdir="$MLX3_TEACHER"
+    [ -f "$tokdir/tokenizer.json" ] || tokdir="$MLX3_REF"
+    if [ ! -f "$tokdir/tokenizer.json" ]; then
+        echo "no tokenizer anywhere. Run mlx3_get teacher or mlx3_get ref."
+        return 1
+    fi
     mkdir -p $MLX3_DATA
-    python3 - "$MLX3_CALIB" "$MLX3_DATA" "$MLX3_CHARS" "$MLX3_TRAIN" "$MLX3_VALID" << 'DATAEOF'
+    echo "window   : $target tokens"
+    echo "tokenizer: $tokdir"
+    python3 - "$MLX3_CALIB" "$MLX3_DATA" "$target" "$MLX3_TRAIN" "$MLX3_VALID" \
+              "$tokdir" "$MLX3_CHARS" << 'DATAEOF'
 import json, sys
-src, out, chars, ntrain, nvalid = sys.argv[1:6]
-chars, ntrain, nvalid = int(chars), int(ntrain), int(nvalid)
+from transformers import AutoTokenizer
+
+src, out, target, ntrain, nvalid, tokdir, forced = sys.argv[1:8]
+target, ntrain, nvalid, forced = int(target), int(ntrain), int(nvalid), int(forced)
+
+tok = AutoTokenizer.from_pretrained(tokdir)
 text = open(src, encoding="utf-8", errors="replace").read()
+
+probe = text[:200000]
+n_tok = len(tok.encode(probe))
+ratio = len(probe) / max(1, n_tok)
+print("characters per token on this corpus: %.2f" % ratio)
+
+if forced > 0:
+    chars = forced
+    print("record length forced to %d characters by MLX3_CHARS" % chars)
+else:
+    chars = int(target * 0.90 * ratio)
+    print("record length %d characters, aimed at %d tokens, ninety percent of"
+          % (chars, int(target * 0.90)))
+    print("the window so nothing is long enough to be dropped")
+
 need = chars * (ntrain + nvalid)
 if len(text) < need:
     print("corpus is %d chars, %d wanted, so there will be fewer records"
           % (len(text), need))
 recs = [text[i:i + chars] for i in range(0, min(len(text), need), chars)]
 recs = [r for r in recs if len(r) > chars // 2]
+
 for name, part in (("train", recs[:ntrain]), ("valid", recs[ntrain:ntrain + nvalid])):
     p = "%s/%s.jsonl" % (out, name)
     with open(p, "w", encoding="utf-8") as f:
         for r in part:
             f.write(json.dumps({"text": r}, ensure_ascii=False) + "\n")
-    print("%-6s %4d records of ~%d chars -> %s" % (name, len(part), chars, p))
+    print("%-6s %4d records -> %s" % (name, len(part), p))
+
+sample = recs[:20]
+lens = sorted(len(tok.encode(r)) for r in sample)
+print()
+print("token length of the first %d records: min %d, median %d, max %d"
+      % (len(sample), lens[0], lens[len(lens) // 2], lens[-1]))
+if lens[-1] > target:
+    print()
+    print("STOP. %d records exceed the %d token window. mlx-lm DROPS those"
+          % (sum(1 for l in lens if l > target), target))
+    print("rather than truncating them, and if all of them are dropped the")
+    print("validation set is empty and the run dies before the first step.")
+    print("Either rerun with a larger window, mlx3_data 4096, or force a")
+    print("shorter record: MLX3_CHARS=6000 mlx3_data")
+    sys.exit(1)
+print("all of them fit, the run will see every record")
 print()
 print("This is the corpus the importance matrix was collected on. The eval set")
 print("is a different split of the same pipeline: a legitimate held out")
 print("measurement, and also our own distribution. The card says so, and the")
 print("winner gets measured on eval_agentic as well.")
 DATAEOF
-    echo
-    echo "if the loader rejects the field name, see what it expects:"
-    echo "  grep -rn \"'text'\" /usr/local/lib/python3*/dist-packages/mlx_lm/tuner/datasets.py | head"
 }
 
 mlx3_dwq_help() {
@@ -946,9 +1028,15 @@ mlx3_dwq() {
         return 1
     fi
     if [ ! -f "$MLX3_DATA/train.jsonl" ]; then
-        echo "no calibration records. Run:  mlx3_data"
+        echo "no calibration records. Run:  mlx3_data $seq"
         return 1
     fi
+    if [ ! -s "$MLX3_DATA/valid.jsonl" ]; then
+        echo "$MLX3_DATA/valid.jsonl is empty. Run:  mlx3_data $seq"
+        return 1
+    fi
+    echo "records were sized for a window; if mlx3_data was run for a smaller"
+    echo "one than $seq that is fine, the other way around is what kills the run."
 
     echo "teacher : $teacher   $(du -sh $teacher | cut -f1)"
     echo "base    : $base   $(du -sh $base | cut -f1)"
