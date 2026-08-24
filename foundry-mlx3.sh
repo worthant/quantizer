@@ -28,7 +28,7 @@
 # Two methods are used and nothing else. Both are explained where they are
 # defined. mlx3_plan prints the arithmetic behind every expected number.
 
-MLX3_VERSION=2026-08-24.02
+MLX3_VERSION=2026-08-24.04
 
 MLX3_UP=${MLX3_UP:-Qwen/Qwen3.8-27B}
 MLX3_ORG=${MLX3_ORG:-AtomicChat}
@@ -164,17 +164,10 @@ for p in ("mlx", "mlx-lm", "mlx-vlm", "numpy", "huggingface_hub"):
 import mlx.core as mx
 import numpy as np
 print("  device           %s" % mx.default_device())
-a = mx.random.normal((4096, 4096)); mx.eval(a)
-t = time.time()
-for _ in range(10):
-    b = a @ a
-mx.eval(b)
-gf = 10 * 2 * 4096 ** 3 / (time.time() - t) / 1e9
-print("  matmul           %.0f GFLOP/s" % gf)
-if gf < 500:
-    print("  that is processor speed. Either the cpu wheel got installed or the")
-    print("  CUDA backend did not pick up the card. Stop and fix it.")
 print("  mlx/numpy bridge %s" % float(np.asarray(mx.ones((3,))).sum()))
+print()
+print("  the device line above is the real check: a cpu-only wheel says cpu.")
+print("  For throughput run mlx3_bench, it is the number the plan depends on.")
 try:
     import scipy
     print("  scipy            ok")
@@ -184,6 +177,51 @@ CHKEOF
     echo
     echo "written to $MLX3_LOGS/mlx3-env.txt. Every published number carries"
     echo "these versions: the flags on these tools move between releases."
+}
+
+# What the card actually does on the shape this work is made of. The plan's
+# timing rests on this number, so it is measured rather than assumed.
+#
+# Two mistakes are easy to make here and both were in the old check. MLX is
+# lazy: a loop that rebinds the result keeps only the last one, so nine of ten
+# matmuls are discarded and never run, and dividing by ten inflates the answer
+# tenfold. And the first matmul of a session includes kernel compilation, which
+# has nothing to do with the card. So: warm up first, hold every result alive,
+# evaluate once.
+mlx3_bench() {
+    python3 - << 'BENCHEOF'
+import time
+import mlx.core as mx
+
+print("device: %s" % mx.default_device())
+print()
+print("%-10s %8s %14s" % ("dtype", "size", "TFLOP/s"))
+for dt, name in ((mx.bfloat16, "bfloat16"), (mx.float32, "float32")):
+    for n in (4096, 8192):
+        a = mx.random.normal((n, n)).astype(dt)
+        b = mx.random.normal((n, n)).astype(dt)
+        mx.eval(a, b)
+        mx.eval(a @ b)                       # warm up, compiles the kernel
+        reps = 20
+        t = time.perf_counter()
+        outs = [a @ b for _ in range(reps)]  # held alive, so all of them run
+        mx.eval(*outs)
+        dt_s = time.perf_counter() - t
+        tf = reps * 2 * n ** 3 / dt_s / 1e12
+        print("%-10s %8d %14.1f" % (name, n, tf))
+        del a, b, outs
+print()
+print("what the bfloat16 8192 row should look like, dense tensor core peak:")
+print("  B200           2250 TFLOP/s peak, expect 1200 or more")
+print("  H200 SXM        990 peak, expect 550 or more")
+print("  H100 NVL        835 peak, expect 450 or more")
+print("  RTX PRO 6000    200-250 peak, expect 120 or more")
+print()
+print("Tens instead of hundreds means MLX is not using the tensor cores on")
+print("this card. Distillation would then take roughly ten times the estimate")
+print("and the whole schedule has to be redrawn, so read this before renting")
+print("anything else.")
+BENCHEOF
 }
 
 mlx3_disk() {
@@ -284,6 +322,34 @@ mlx3_get() {
         echo "mlx3_get src | ref | teacher | eval | calib | base LABEL | all"
         return 1 ;;
     esac
+}
+
+
+# mlx3_wait LABEL
+#
+# The handoff between the two boxes. The hub builds a base, clips it and pushes
+# it; this box polls for it and pulls it the moment it lands. Run it as the last
+# command of the preparation block and walk away.
+#
+#   mlx3_wait 3bit-CLIP
+mlx3_wait() {
+    if [ -z "$1" ]; then
+        echo "mlx3_wait LABEL        e.g. mlx3_wait 3bit-CLIP"
+        echo "polls $MLX3_ORG/$MLX3_STEM-MLX-<LABEL> until it exists, then pulls it"
+        return 1
+    fi
+    echo "waiting for $MLX3_ORG/$MLX3_STEM-MLX-$1 to appear. Ctrl-C to stop."
+    while true; do
+        if mlx3_get base "$1" 2>/dev/null; then
+            echo
+            echo "got it. Check the size above against what the hub reported: a"
+            echo "smaller number means the upload was still in flight, in which"
+            echo "case delete the directory and run this again."
+            return 0
+        fi
+        echo "  not published yet, $(date +%H:%M:%S), retry in 30s"
+        sleep 30
+    done
 }
 
 
@@ -452,6 +518,18 @@ for repo in sys.argv[1:]:
     groups.setdefault(joint, []).append(repo)
 print()
 vals = list(groups.values())
+pairs = [g for g in vals if len(g) > 1]
+if pairs and len(vals) > 1:
+    print("PARTIAL MATCH. These hold byte for byte the same tensors:")
+    for g in pairs:
+        print("   ", ", ".join(g))
+    print()
+    print("That pair is the most useful line in this output. Two identical")
+    print("files measured by our own harness can only differ by harness noise,")
+    print("so the gap between their published numbers IS the noise floor, and")
+    print("everything above it in the wider spread is real difference between")
+    print("files that were all made by supposedly the same command.")
+    print()
 if len(vals) == 1 and len(vals[0]) > 1:
     print("IDENTICAL. Every repo above holds byte for byte the same tensors, so")
     print("the 0.17 percent spread between their measured numbers is harness")
@@ -1608,9 +1686,14 @@ BOXHEOF
 cat << 'BOXDEOF'
 
 BOX 2, distillation. B200 if the Blackwell check on box 1 passed, otherwise a
-second H200. Rent it about FIFTEEN MINUTES after box 1, not at the same time:
-it needs that long to pull its own 82 GB, and by then the first base is on the
-hub. Renting it earlier is paying for an idle card.
+second H200. The trigger is a command, not a clock: rent this box the moment
+box 1 starts mlx3_quant 3 64. From there it is twelve minutes of building, six
+of clipping and four of pushing before the base exists, which is exactly how
+long this box needs for its own setup, its 82 GB and its reference cache.
+Renting it earlier is paying for an idle card.
+
+Filter the offer by driver version first. The mlx[cuda13] wheel needs 580 or
+newer, and a B200 on an older host will not start at all.
 
 One box runs BOTH lanes one after the other. On a B200 a 600 step run is about
 eight minutes, so two lanes plus their measurements fit in well under an hour,
@@ -1629,10 +1712,10 @@ which is cheaper than two expensive boxes in parallel.
   mlx3_cache
   mlx3_data
   mlx3_dwq_help
+  mlx3_wait 3bit-CLIP             <- polls the hub, pulls it when it lands
 
 Then the low end lane, which is the main bet:
 
-  mlx3_get base 3bit-CLIP
   mlx3_mem 3 64 2048
   mlx3_dwq 3 64 /mlx/Qwen3.8-27B-MLX-3bit-CLIP
   mlx3_kld /mlx/Qwen3.8-27B-MLX-3bit-CLIP-DWQ
@@ -1641,7 +1724,7 @@ Then the low end lane, which is the main bet:
 Then the 4 bit lane, unless box 1 reported under two percent from clipping
 there:
 
-  mlx3_get base 4bit-CLIP
+  mlx3_wait 4bit-CLIP
   mlx3_dwq 4 64 /mlx/Qwen3.8-27B-MLX-4bit-CLIP
   mlx3_kld /mlx/Qwen3.8-27B-MLX-4bit-CLIP-DWQ
   mlx3_table
@@ -1655,6 +1738,11 @@ the best foreign build is 0.180793. It needs 83 GB, so a B200 or an H200 only:
   mlx3_clip /mlx/Qwen3.8-27B-MLX-3bit-g32
   mlx3_dwq 3 32 /mlx/Qwen3.8-27B-MLX-3bit-g32-CLIP
   mlx3_kld /mlx/Qwen3.8-27B-MLX-3bit-g32-CLIP-DWQ
+
+IF THIS BOX NEVER HAPPENS. A 94 GB card runs the whole plan on its own: the
+3 bit lane needs 67.3 GB and the 4 bit lane 70.7. On the hub, add mlx3_get
+teacher and run both lanes there one after the other, seventeen minutes each
+instead of eight. The second box is a speedup, not a requirement.
 
 Checkpoints:
 
@@ -1683,9 +1771,10 @@ BOXDEOF
 mlx3_help() {
 cat << 'H3EOF'
 
-SETUP     mlx3_setup | mlx3_check | mlx3_persist | mlx3_disk
+SETUP     mlx3_setup | mlx3_check | mlx3_bench | mlx3_persist | mlx3_disk
 DOWNLOAD  mlx3_get src | ref | teacher | eval | calib | base LABEL
 MEASURE   mlx3_cache | mlx3_kld DIR | mlx3_all | mlx3_table
+HANDOFF   mlx3_wait LABEL               poll the hub for a base, then pull it
 CHECKS    mlx3_verify | mlx3_fp_remote | mlx3_fingerprint DIR
           mlx3_repeat DIR | mlx3_tail
 BUILD     mlx3_quant BITS [GROUP]        plain rung, needs /src
