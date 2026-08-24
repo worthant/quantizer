@@ -28,7 +28,7 @@
 # Two methods are used and nothing else. Both are explained where they are
 # defined. mlx3_plan prints the arithmetic behind every expected number.
 
-MLX3_VERSION=2026-08-24.06
+MLX3_VERSION=2026-08-24.07
 
 MLX3_UP=${MLX3_UP:-Qwen/Qwen3.8-27B}
 MLX3_ORG=${MLX3_ORG:-AtomicChat}
@@ -497,6 +497,69 @@ TBLEOF
 # ship a 4 bit build that should be the same file, and their measured numbers
 # spread by 0.17 percent. Either the files differ or the harness is noisy.
 # Those two have opposite consequences and both are cheap to settle.
+# mlx3_diff BUILD_A BUILD_B
+#
+# Two measured builds side by side across every metric, not just the mean.
+# Written because the mean hides the thing that matters: at 3 bits the
+# clipping search moved the median by 5.6 percent in the right direction and
+# the 99th percentile by 3.3 percent in the wrong one, and the mean, which the
+# tail dominates, showed 0.8 percent and told you nothing.
+#
+#   mlx3_diff Qwen3.8-27B-MLX-3bit Qwen3.8-27B-MLX-3bit-CLIP
+mlx3_diff() {
+    if [ -z "$2" ]; then
+        echo "mlx3_diff BUILD_A BUILD_B      names as they appear in mlx3_table"
+        ls $MLX3_LOGS/kld-*.json 2>/dev/null | sed "s|.*/kld-||; s|\.json$||; s|^|   |"
+        return 1
+    fi
+    python3 - "$MLX3_LOGS" "$(basename ${1%/})" "$(basename ${2%/})" << 'DIFFEOF'
+import json, os, sys
+log, na, nb = sys.argv[1:4]
+
+def get(n):
+    p = os.path.join(log, "kld-%s.json" % n)
+    if not os.path.exists(p):
+        print("not measured on this box: %s" % n)
+        sys.exit(1)
+    return json.load(open(p))
+
+a, b = get(na), get(nb)
+print()
+print("A: %s" % na)
+print("B: %s" % nb)
+print()
+rows = [("mean KLD", "mean_kld", 1),
+        ("median KLD", "median_kld", 1),
+        ("90th KLD", "p90_kld", 1),
+        ("95th KLD", "p95_kld", 1),
+        ("99th KLD", "p99_kld", 1),
+        ("max KLD", "max_kld", 1),
+        ("quant ppl", "quant_ppl", 1),
+        ("|mean delta p|", "mean_delta_p_points", 1),
+        ("rms delta p", "rms_delta_p_points", 1),
+        ("same top-1 %", "top1_agree_pct", -1)]
+print("%-16s %13s %13s %11s   %s" % ("", "A", "B", "B vs A", ""))
+for label, key, sign in rows:
+    x, y = a.get(key), b.get(key)
+    if x is None or y is None:
+        continue
+    # a signed metric whose best value is zero is compared by distance from it,
+    # otherwise a bias of -3.1 improving to -2.4 reads as a 22 percent rise
+    if key == "mean_delta_p_points":
+        x, y = abs(x), abs(y)
+    rel = 0.0 if x == 0 else 100.0 * (y - x) / abs(x)
+    good = (rel * sign) < 0
+    mark = "better" if abs(rel) > 0.25 and good else ("worse" if abs(rel) > 0.25 and not good else "noise")
+    print("%-16s %13.6f %13.6f %+10.2f %%   %s" % (label, x, y, rel, mark))
+print()
+print("0.25 percent is three times the measured harness noise on one box, so")
+print("anything smaller than that is marked noise and should not be argued")
+print("about. A build can be better on the median and worse at the 99th: the")
+print("mean is dominated by the tail, so read the whole column before deciding")
+print("what a change did.")
+DIFFEOF
+}
+
 mlx3_verify() {
     echo "=============== 1. are the four 4 bit builds one file ==============="
     echo "hashes straight off the hub, nothing downloaded, five seconds"
@@ -1862,6 +1925,7 @@ cat << 'H3EOF'
 SETUP     mlx3_setup | mlx3_check | mlx3_bench | mlx3_persist | mlx3_disk
 DOWNLOAD  mlx3_get src | ref | teacher | eval | calib | base LABEL
 MEASURE   mlx3_cache | mlx3_kld DIR | mlx3_all | mlx3_table
+          mlx3_diff A B                 two builds across every metric
 HANDOFF   mlx3_wait LABEL               poll the hub for a base, then pull it
 CHECKS    mlx3_verify | mlx3_fp_remote | mlx3_fingerprint DIR
           mlx3_repeat DIR | mlx3_tail
