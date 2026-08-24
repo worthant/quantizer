@@ -28,7 +28,7 @@
 # Two methods are used and nothing else. Both are explained where they are
 # defined. mlx3_plan prints the arithmetic behind every expected number.
 
-MLX3_VERSION=2026-08-24.07
+MLX3_VERSION=2026-08-24.12
 
 MLX3_UP=${MLX3_UP:-Qwen/Qwen3.8-27B}
 MLX3_ORG=${MLX3_ORG:-AtomicChat}
@@ -62,18 +62,61 @@ MLX3_ALPHAS=${MLX3_ALPHAS:-"1.000 0.995 0.985 0.970 0.955 0.940 0.920 0.900 0.88
 
 # Distillation defaults, taken from published runs rather than from what fits
 # in the least memory. See the comment above mlx3_dwq.
-MLX3_DATA=${MLX3_DATA:-/dwq-data}
+MLX3_DATA=${MLX3_DATA:-default}     # see the note above mlx3_dwq
 MLX3_CHARS=${MLX3_CHARS:-0}   # 0 means measure it, see mlx3_data
 MLX3_TRAIN=${MLX3_TRAIN:-600}
 MLX3_VALID=${MLX3_VALID:-60}
-MLX3_SEQ=${MLX3_SEQ:-2048}
+# 512 rather than 2048, and the reason is not calibration quality.
+#
+# With --batch-size 1 every record goes at its own length and iterate_batches
+# pads a batch to its longest member, which is that record. The logits are then
+# [1, length, 248320], so a new length means a new buffer size for the MLX
+# allocator to cache AND a new graph for the CUDA backend to compile, and
+# nothing evicts either. Six hundred records is up to six hundred shapes.
+# Measured: target computation grew about 0.8 GB per batch and a 94 GB card
+# died at batch 50 while a 143 GB one reached 442.
+#
+# Most tulu records are longer than 512, so a 512 window truncates nearly all
+# of them to exactly 512 and the shapes collapse to one. Memory goes flat.
+# The eval scores positions 2048 to 4095, so this is a real mismatch, but DWQ
+# tunes per-group scales and those do not depend on position to first order,
+# and a run that finishes beats a run that does not.
+MLX3_SEQ=${MLX3_SEQ:-512}
 MLX3_LR=${MLX3_LR:-3e-7}
-MLX3_SAMPLES=${MLX3_SAMPLES:-600}
+MLX3_SAMPLES=${MLX3_SAMPLES:-600}   # 0 drops the flag entirely
 
-# The CUDA backend keeps a fixed size cache of compiled graphs and throws
-# rather than evicting. Zero is rejected, too large eats the memory the graphs
-# need. 6144 is the value that worked.
-export MLX_CUDA_GRAPH_CACHE_SIZE=${MLX_CUDA_GRAPH_CACHE_SIZE:-6144}
+# How many compiled CUDA graphs the backend keeps. Both extremes have now been
+# hit on this job and the mechanism is the same one.
+#
+# With --batch-size 1 every record goes at its own length, iterate_batches pads
+# a batch to its longest member, and one member means the record itself. Six
+# hundred records is up to six hundred distinct tensor shapes, and a distinct
+# shape compiles a distinct graph.
+#
+#   1      the backend evicts on every step and refuses:
+#          "Cache thrashing is happening, please set MLX_CUDA_GRAPH_CACHE_SIZE
+#          to a larger value than 1", then aborts inside a destructor
+#   6144   thousands of graphs are held, each pinning the allocations it
+#          captured, and a 143 GB card runs out of memory
+#
+# 2048 sits between them. Watch nvidia-smi over the first fifty steps rather
+# than trusting this number.
+export MLX_CUDA_GRAPH_CACHE_SIZE=${MLX_CUDA_GRAPH_CACHE_SIZE:-2048}
+
+# Where mlx_lm.dwq keeps the precomputed teacher logits. Passing --target-dir
+# is what makes this job fit: the teacher is loaded, the targets are written as
+# top-k values plus indices, and then
+#     if has_targets and model is not None: del model
+# the teacher leaves memory. After that loss_fn gathers the student's logits
+# down to k with take_along_axis instead of running the KL over all 248320
+# columns. Both of the two big terms go away: 37 GB instead of 91.
+# One directory per window. Targets computed at 2048 are the wrong shape for a
+# run at 512, and silently reusing them is worse than recomputing.
+MLX3_TARGETS=${MLX3_TARGETS:-}
+
+# Appended verbatim to the mlx_lm.dwq command line. For flags this file does
+# not model yet, above all the precomputed targets path.
+MLX3_EXTRA=${MLX3_EXTRA:-}
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HOME=${HF_HOME:-/hf}
 
@@ -873,48 +916,72 @@ mlx3_clip() {
 
 # Memory arithmetic, printed before renting rather than discovered after.
 mlx3_mem() {
-    python3 - "${1:-4}" "${2:-64}" "${3:-2048}" << 'MEMEOF'
+    python3 - "${1:-4}" "${2:-64}" "${3:-2048}" "${4:-full}" << 'MEMEOF'
 import sys
 bits, group, seq = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+mode = sys.argv[4]                               # full | targets
 params = 27.3e9          # the text half, the vision tower is not touched
 vocab, hidden, layers = 248320, 5120, 64
 
-teacher = 29.5                                   # the 8 bit build
+# The term that was wrong. The loss is
+#     kl_div_loss(scale * student_logits, scale * teacher_logits)
+# over the FULL vocabulary, and every intermediate is a [seq, vocab] float32
+# tensor: both scaled inputs, the teacher softmax, its log, the student
+# log_softmax with its own max, exp and sum, the product, and then the
+# backward pass through all of it. Twelve to fifteen of them are alive at
+# once. This file used to count two and that is how a 27B model on a 143 GB
+# card ran out of memory.
+one = seq * vocab * 4 / 1e9
+copies = 14 if mode == "full" else 2
+
+teacher = 29.5 if mode == "full" else 0.0        # deleted once targets exist
 student = 0.92 + 3.365 * (bits + 32.0 / group)
-train = 2 * params / group                       # one scale and one bias per group
-optim = train * 16 / 1e9                         # param + grad + adam m + adam v, fp32
-acts = layers * seq * hidden * 2 / 1e9           # layer inputs kept for recompute
-logits = 2 * seq * vocab * 4 / 1e9               # both models, fp32
-soft = logits                                    # log softmax temporaries
-peak = 2.0                                       # recompute inside one layer
+train = 2 * params / group
+optim = train * 20 / 1e9        # fp32 param, grad, adam m, adam v, plus the
+                                # astype copy loss_fn makes every step
+acts = layers * seq * hidden * 2 / 1e9
+logits = copies * one
+peak = 2.0
 
 print()
-print("distillation at %d bits, group %d, window %d, batch 1" % (bits, group, seq))
+print("distillation at %d bits, group %d, window %d, targets %s"
+      % (bits, group, seq, "precomputed" if mode == "targets" else "on the fly"))
 print()
 print("  teacher, 8 bit                        %6.1f GB" % teacher)
 print("  student                               %6.1f GB" % student)
-print("  %6.0f M trainable scales and biases   %6.1f GB" % (train / 1e6, optim))
+print("  %6.0f M trainable, fp32 with adam     %6.1f GB" % (train / 1e6, optim))
 print("  activations with grad checkpoint      %6.1f GB" % acts)
-print("  logits of both models                 %6.1f GB" % logits)
-print("  log softmax temporaries               %6.1f GB" % soft)
-print("  recompute peak inside one layer       %6.1f GB" % peak)
-total = teacher + student + optim + acts + logits + soft + peak
+print("  loss over the vocabulary, %2d x %.2f  %6.1f GB" % (copies, one, logits))
+print("  allocator slack                       %6.1f GB" % peak)
+total = teacher + student + optim + acts + logits + peak
 print("  " + "-" * 46)
 print("  total                                 %6.1f GB" % total)
 print()
-for name, cap in (("H200 NVL", 141), ("RTX PRO 6000", 96)):
+for name, cap in (("B200", 180), ("H200 NVL", 141), ("H100 NVL", 94),
+                  ("RTX PRO 6000", 96)):
     head = cap - total
-    if head > 25:
-        v = "fits with room"
-    elif head > 8:
-        v = "fits, but fragmentation could bite"
-    else:
-        v = "DO NOT. Drop the window to 1024 first"
+    v = "fits with room" if head > 30 else ("tight" if head > 10 else "NO")
     print("  %-14s %3d GB   headroom %+6.1f GB   %s" % (name, cap, head, v))
 print()
-print("This is an estimate, not a measurement. Watch nvidia-smi over the first")
-print("fifty steps: if it settles below the total above, the rest of the run is")
-print("flat and it will not grow.")
+if mode == "full":
+    print("Two levers, in this order, before renting a bigger card:")
+    print()
+    print("  precomputed targets. mlx_lm.dwq can compute the teacher logits")
+    print("  once, store them as top-k values plus indices, DELETE the teacher,")
+    print("  and then gather the student's logits down to k so the loss stops")
+    print("  touching 248320 columns. Both big terms vanish at once. Find the")
+    print("  flag with:  mlx_lm.dwq --help 2>&1 | grep -i -B1 -A3 target")
+    print("  then pass it through MLX3_EXTRA. Compare:  mlx3_mem %d %d %d targets"
+          % (bits, group, seq))
+    print()
+    print("  a shorter window. The loss term is linear in it, so 2048 to 512")
+    print("  divides %.1f GB by four." % logits)
+else:
+    print("This is the configuration to aim for. It fits on every card above,")
+    print("and the window can stay at 2048 where the eval actually scores.")
+print()
+print("An estimate, not a measurement. Watch nvidia-smi over the first fifty")
+print("steps: if it settles below the total, the rest of the run is flat.")
 MEMEOF
 }
 
@@ -1021,6 +1088,58 @@ mlx3_dwq_help() {
     fi
 }
 
+# mlx3_targets [SEQ] [SAMPLES]
+#
+# The teacher logits, computed once, as top-k values plus indices on disk. Run
+# it as its own pass so a failure costs only this phase rather than a loaded
+# student and a built optimizer as well.
+#
+# The result serves BOTH lanes: same teacher, same data, same sample count,
+# same seed, so 3 bit and 4 bit reuse one directory.
+#
+# Watch it from a second tmux pane:  nvidia-smi -l 5
+# Flat memory means the shapes collapsed as intended. Still climbing means
+# they did not, so halve MLX3_SEQ and start again.
+mlx3_targets() {
+    local seq="${1:-$MLX3_SEQ}"
+    local samples="${2:-$MLX3_SAMPLES}"
+    if [ ! -f "$MLX3_TEACHER/config.json" ]; then
+        echo "no teacher at $MLX3_TEACHER. Run:  mlx3_get teacher"
+        return 1
+    fi
+    local dataflag="--data-path $MLX3_DATA"
+    [ "$MLX3_DATA" = "default" ] && dataflag=""
+    local sampleflag="--num-samples $samples"
+    [ "$samples" = "0" ] && sampleflag=""
+    mkdir -p "$MLX3_TARGETS"
+    echo "teacher : $MLX3_TEACHER"
+    echo "targets : $MLX3_TARGETS"
+    echo "window  : $seq, batch 1, graph cache $MLX_CUDA_GRAPH_CACHE_SIZE"
+    echo
+    echo "in a second pane:  nvidia-smi -l 5"
+    echo "memory has to stay flat. If it climbs by roughly a gigabyte a batch,"
+    echo "the shapes are not collapsing: halve the window and start again."
+    echo
+    date
+    if command -v mlx_lm.dwq > /dev/null 2>&1; then
+        stdbuf -oL -eL mlx_lm.dwq --model "$MLX3_TEACHER" \
+            --mlx-path /tmp/mlx3-unused $dataflag $sampleflag \
+            --batch-size 1 --max-seq-length "$seq" \
+            --target-dir "$MLX3_TARGETS" --targets-only \
+            2>&1 | tee "$MLX3_LOGS/targets-s$seq.log"
+    else
+        stdbuf -oL -eL python3 -m mlx_lm quant.dwq --model "$MLX3_TEACHER" \
+            --mlx-path /tmp/mlx3-unused $dataflag $sampleflag \
+            --batch-size 1 --max-seq-length "$seq" \
+            --target-dir "$MLX3_TARGETS" --targets-only \
+            2>&1 | tee "$MLX3_LOGS/targets-s$seq.log"
+    fi
+    date
+    du -sh "$MLX3_TARGETS"
+    echo
+    echo "both lanes reuse this. Next:  mlx3_dwq 3 64 /mlx/<stem>-MLX-3bit-CLIP"
+}
+
 # mlx3_dwq BITS GROUP BASE [TEACHER] [SEQ] [LR] [SAMPLES]
 #
 # WHAT IT DOES
@@ -1090,22 +1209,66 @@ mlx3_dwq() {
         echo "no teacher at $teacher. Run:  mlx3_get teacher"
         return 1
     fi
-    if [ ! -f "$MLX3_DATA/train.jsonl" ]; then
-        echo "no calibration records. Run:  mlx3_data $seq"
-        return 1
+    # WHY THE DEFAULT IS NOT OUR OWN CORPUS, mlx-lm 0.31.3
+    #
+    # --data-path pointing at a local directory of train.jsonl and valid.jsonl
+    # does not work. It routes through load_custom_hf_dataset rather than
+    # load_local_dataset, and there, in mlx_lm/tuner/datasets.py:
+    #
+    #     train_split = ds.get("train_split", "train[:80%]")
+    #     valid_split = ds.get("valid_split", "train[-10%:]")
+    #
+    # validation is sliced out of the TRAIN split and valid.jsonl is never
+    # read. The result is an empty validation set and the run dies before the
+    # first step with "Dataset must have at least batch_size=1 examples but
+    # only has 0". Record length has nothing to do with it: 1000 token records
+    # against a 4096 window fail the same way, and max_seq_length does not
+    # appear in that file at all. Isolated by two runs, one with --data-path
+    # and no --num-samples (fails), one with neither (works).
+    #
+    #   MLX3_DATA=default     mlx-lm's own set, allenai/tulu-3-sft-mixture.
+    #                         Foreign calibration, which goes in the model
+    #                         card. It also makes the result directly
+    #                         comparable to the published runs and removes any
+    #                         argument that we calibrated on our own eval
+    #   MLX3_DATA=/dwq-data   our corpus, for when the bug upstream is fixed
+    #   MLX3_SAMPLES=0        drop --num-samples. Innocent in the above, but
+    #                         with the default set it is what stops the run
+    #                         from walking the whole 939343 record mixture
+    local dataflag="--data-path $MLX3_DATA"
+    local sampleflag="--num-samples $samples"
+    if [ "$MLX3_DATA" = "default" ]; then
+        dataflag=""
+        echo "data    : mlx-lm's own default set, ours is not used"
+    else
+        if [ ! -f "$MLX3_DATA/train.jsonl" ]; then
+            echo "no calibration records. Run:  mlx3_data $seq"
+            return 1
+        fi
+        if [ ! -s "$MLX3_DATA/valid.jsonl" ]; then
+            echo "$MLX3_DATA/valid.jsonl is empty. Run:  mlx3_data $seq"
+            return 1
+        fi
     fi
-    if [ ! -s "$MLX3_DATA/valid.jsonl" ]; then
-        echo "$MLX3_DATA/valid.jsonl is empty. Run:  mlx3_data $seq"
-        return 1
-    fi
-    echo "records were sized for a window; if mlx3_data was run for a smaller"
-    echo "one than $seq that is fine, the other way around is what kills the run."
+    [ "$samples" = "0" ] && sampleflag=""
+
+    # --target-dir is not optional on this model, see the note at the top of
+    # the file. If the directory is empty dwq fills it first and drops the
+    # teacher afterwards, so no separate pass is needed. If the target
+    # computation itself runs out of memory, split it by hand: the same
+    # command with --targets-only added, then the same command without it.
+    local targets="$MLX3_TARGETS"
+    [ -z "$targets" ] && targets="/mlx/dwq-targets-$seq"
+    mkdir -p "$targets"
 
     echo "teacher : $teacher   $(du -sh $teacher | cut -f1)"
     echo "base    : $base   $(du -sh $base | cut -f1)"
     echo "target  : $out"
-    echo "bits $bits, group $group, window $seq, batch 1, $samples samples, rate $lr"
-    mlx3_mem "$bits" "$group" "$seq"
+    echo "bits $bits, group $group, window $seq, batch 1, rate $lr"
+    echo "flags   : $dataflag $sampleflag $MLX3_EXTRA"
+    echo "targets : $targets"
+    echo "graph cache: $MLX_CUDA_GRAPH_CACHE_SIZE   (1 aborts, 6144 runs out of memory)"
+    mlx3_mem "$bits" "$group" "$seq" targets
     echo
     echo "WHAT TO WATCH. The log prints a training and a validation loss, and"
     echo "both are the same quantity the table measures. Falling steadily is"
@@ -1113,9 +1276,25 @@ mlx3_dwq() {
     echo "it. Falling a few percent over the whole run means too low, triple it."
     echo "Published 3 bit runs fall by 40 to 47 percent."
     echo
-    echo "IF IT DIES. Memory, in this order: --max-seq-length 1024, then"
-    echo "--num-samples 300, then a larger group. Graph cache: halve or double"
-    echo "MLX_CUDA_GRAPH_CACHE_SIZE, zero is rejected."
+    echo "IF IT DIES ON MEMORY WHILE COMPUTING TARGETS, it is not the card."
+    echo "Measured: a 94 GB card died at batch 50 of 600 and a 143 GB card at"
+    echo "batch 442 of the same 600. Half again the memory bought nine times"
+    echo "the batches, which means the memory ACCUMULATES rather than peaking."
+    echo "With batch size 1 every record goes at its own length, every length"
+    echo "is a new tensor shape, and the allocator cannot reuse a buffer sized"
+    echo "for 1700 tokens to hold 1900. Five hundred lengths is five hundred"
+    echo "pools that never merge. A bigger card dies later, not never."
+    echo
+    echo "The fix is a shorter window, and it works on both causes at once:"
+    echo "buffers are smaller, AND almost every record is longer than 512 so"
+    echo "almost every one truncates to exactly 512. The long tail of lengths"
+    echo "collapses into one dominant shape, the buffer cache starts being"
+    echo "reused and the graph cache stops growing."
+    echo
+    echo "  --max-seq-length 512 --num-samples 300"
+    echo
+    echo "Use a fresh target directory when the window changes: targets are"
+    echo "shaped by it. This function names one per window automatically."
     echo
     date
     rm -rf "$out"
@@ -1123,7 +1302,8 @@ mlx3_dwq() {
         stdbuf -oL -eL mlx_lm.dwq \
             --model "$teacher" --quantized-model "$base" --mlx-path "$out" \
             --bits "$bits" --group-size "$group" \
-            --data-path "$MLX3_DATA" --num-samples "$samples" \
+            $dataflag $sampleflag $MLX3_EXTRA \
+            --target-dir "$targets" \
             --batch-size 1 --max-seq-length "$seq" \
             --learning-rate "$lr" --grad-checkpoint \
             2>&1 | tee "$MLX3_LOGS/dwq-$tag.log"
@@ -1131,7 +1311,8 @@ mlx3_dwq() {
         stdbuf -oL -eL python3 -m mlx_lm quant.dwq \
             --model "$teacher" --quantized-model "$base" --mlx-path "$out" \
             --bits "$bits" --group-size "$group" \
-            --data-path "$MLX3_DATA" --num-samples "$samples" \
+            $dataflag $sampleflag $MLX3_EXTRA \
+            --target-dir "$targets" \
             --batch-size 1 --max-seq-length "$seq" \
             --learning-rate "$lr" --grad-checkpoint \
             2>&1 | tee "$MLX3_LOGS/dwq-$tag.log"
@@ -1931,7 +2112,8 @@ CHECKS    mlx3_verify | mlx3_fp_remote | mlx3_fingerprint DIR
           mlx3_repeat DIR | mlx3_tail
 BUILD     mlx3_quant BITS [GROUP]        plain rung, needs /src
           mlx3_clip TEMPLATE [SUFFIX]    better rounding, identical size
-DISTILL   mlx3_mem BITS GROUP SEQ        memory before renting
+DISTILL   mlx3_mem BITS GROUP SEQ [full|targets]
+          mlx3_targets [SEQ] [SAMPLES]  teacher logits once, serves both lanes
           mlx3_data | mlx3_dwq_help
           mlx3_dwq BITS GROUP BASE [TEACHER] [SEQ] [LR] [SAMPLES]
 VISION    mlx3_reattach TEXT VISION OUT
