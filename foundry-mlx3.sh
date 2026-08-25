@@ -28,7 +28,7 @@
 # Two methods are used and nothing else. Both are explained where they are
 # defined. mlx3_plan prints the arithmetic behind every expected number.
 
-MLX3_VERSION=2026-08-24.12
+MLX3_VERSION=2026-08-25.01
 
 MLX3_UP=${MLX3_UP:-Qwen/Qwen3.8-27B}
 MLX3_ORG=${MLX3_ORG:-AtomicChat}
@@ -82,6 +82,7 @@ MLX3_VALID=${MLX3_VALID:-60}
 # tunes per-group scales and those do not depend on position to first order,
 # and a run that finishes beats a run that does not.
 MLX3_SEQ=${MLX3_SEQ:-512}
+MLX3_BATCH=${MLX3_BATCH:-4}     # batch 1 makes one tensor shape per record
 MLX3_LR=${MLX3_LR:-3e-7}
 MLX3_SAMPLES=${MLX3_SAMPLES:-600}   # 0 drops the flag entirely
 
@@ -102,6 +103,31 @@ MLX3_SAMPLES=${MLX3_SAMPLES:-600}   # 0 drops the flag entirely
 # 2048 sits between them. Watch nvidia-smi over the first fifty steps rather
 # than trusting this number.
 export MLX_CUDA_GRAPH_CACHE_SIZE=${MLX_CUDA_GRAPH_CACHE_SIZE:-2048}
+
+# THE ONE THAT ACTUALLY FIXED IT.
+#
+# Every failure on a distillation step, across a whole day, came out of the
+# same file and none came out of the arithmetic:
+#
+#   cudaGraphAddDependencies ... invalid argument
+#   cudaGraphInstantiate     ... out of memory
+#   cudaGraphAddKernelNode   ... an illegal memory access was encountered
+#   Cache thrashing is happening, set MLX_CUDA_GRAPH_CACHE_SIZE larger than N
+#
+# A compiled graph remembers the buffer addresses it was built with, the
+# allocator reuses those buffers between steps, and replaying the graph then
+# reads memory that belongs to something else. Tuning the cache size only
+# chose which way it broke: small gave thrashing and an abort, large gave out
+# of memory or the illegal access. Turning graph capture off removes the whole
+# class. Cost is per-kernel launch overhead, about 25 seconds a step instead
+# of 27 at batch 4, which is nothing.
+#
+# Found with:
+#   for f in $(find <site-packages>/mlx -name "*.so*"); do strings "$f"; done \
+#     | grep -o "MLX_[A-Z_]*" | sort -u
+# MLX_DISABLE_COMPILE is a different thing, operation fusion, and it does not
+# help here.
+export MLX_USE_CUDA_GRAPHS=${MLX_USE_CUDA_GRAPHS:-0}
 
 # Where mlx_lm.dwq keeps the precomputed teacher logits. Passing --target-dir
 # is what makes this job fit: the teacher is loaded, the targets are written as
@@ -1114,7 +1140,7 @@ mlx3_targets() {
     mkdir -p "$MLX3_TARGETS"
     echo "teacher : $MLX3_TEACHER"
     echo "targets : $MLX3_TARGETS"
-    echo "window  : $seq, batch 1, graph cache $MLX_CUDA_GRAPH_CACHE_SIZE"
+    echo "window  : $seq, batch $MLX3_BATCH, graphs $MLX_USE_CUDA_GRAPHS"
     echo
     echo "in a second pane:  nvidia-smi -l 5"
     echo "memory has to stay flat. If it climbs by roughly a gigabyte a batch,"
@@ -1124,13 +1150,13 @@ mlx3_targets() {
     if command -v mlx_lm.dwq > /dev/null 2>&1; then
         stdbuf -oL -eL mlx_lm.dwq --model "$MLX3_TEACHER" \
             --mlx-path /tmp/mlx3-unused $dataflag $sampleflag \
-            --batch-size 1 --max-seq-length "$seq" \
+            --batch-size "$MLX3_BATCH" --max-seq-length "$seq" \
             --target-dir "$MLX3_TARGETS" --targets-only \
             2>&1 | tee "$MLX3_LOGS/targets-s$seq.log"
     else
         stdbuf -oL -eL python3 -m mlx_lm quant.dwq --model "$MLX3_TEACHER" \
             --mlx-path /tmp/mlx3-unused $dataflag $sampleflag \
-            --batch-size 1 --max-seq-length "$seq" \
+            --batch-size "$MLX3_BATCH" --max-seq-length "$seq" \
             --target-dir "$MLX3_TARGETS" --targets-only \
             2>&1 | tee "$MLX3_LOGS/targets-s$seq.log"
     fi
@@ -1158,8 +1184,18 @@ mlx3_targets() {
 # about 1.09 M tokens, report validation loss falling 0.146 -> 0.088 and
 # 0.168 -> 0.089, so 40 and 47 percent.
 #
-#   3 bits, 12.70 GB : 0.222903 plain, ~0.180 after clipping, target 0.108
-#   4 bits, 16.05 GB : 0.055803 plain, ~0.051 after clipping, target 0.043
+# MEASURED ON THIS MODEL, 3 bits, group 64, batch 4, window 512, 150 steps,
+# 8 bit teacher, tulu-3-sft-mixture, rate 3e-7, one hour on an H200 NVL:
+#
+#   validation loss 0.296 at step 0 -> 0.155 at step 149, so 47.6 percent
+#   peak memory 70.3 GB, which also fits a 94 GB card
+#
+# That loss is against the TEACHER on tulu. The table measures against bf16 on
+# eval_neutral, so the two are the same shape but not the same number. Only
+# mlx3_kld says what actually happened.
+#
+#   3 bits, 12.70 GB : 0.221627 after clipping, 0.116 if 47.6 percent carries
+#   4 bits, 16.05 GB : 0.054444 after clipping
 #
 # The 4 bit figure assumes 15 percent and there is no direct measurement for
 # it. WaveCut reports 3.6 percent at 4 bits, which cannot be what the method
@@ -1264,7 +1300,8 @@ mlx3_dwq() {
     echo "teacher : $teacher   $(du -sh $teacher | cut -f1)"
     echo "base    : $base   $(du -sh $base | cut -f1)"
     echo "target  : $out"
-    echo "bits $bits, group $group, window $seq, batch 1, rate $lr"
+    echo "bits $bits, group $group, window $seq, batch $MLX3_BATCH, rate $lr"
+    echo "cuda graphs: $MLX_USE_CUDA_GRAPHS   (1 breaks on this model, see the top of the file)"
     echo "flags   : $dataflag $sampleflag $MLX3_EXTRA"
     echo "targets : $targets"
     echo "graph cache: $MLX_CUDA_GRAPH_CACHE_SIZE   (1 aborts, 6144 runs out of memory)"
@@ -1304,7 +1341,7 @@ mlx3_dwq() {
             --bits "$bits" --group-size "$group" \
             $dataflag $sampleflag $MLX3_EXTRA \
             --target-dir "$targets" \
-            --batch-size 1 --max-seq-length "$seq" \
+            --batch-size "$MLX3_BATCH" --max-seq-length "$seq" \
             --learning-rate "$lr" --grad-checkpoint \
             2>&1 | tee "$MLX3_LOGS/dwq-$tag.log"
     else
@@ -1313,7 +1350,7 @@ mlx3_dwq() {
             --bits "$bits" --group-size "$group" \
             $dataflag $sampleflag $MLX3_EXTRA \
             --target-dir "$targets" \
-            --batch-size 1 --max-seq-length "$seq" \
+            --batch-size "$MLX3_BATCH" --max-seq-length "$seq" \
             --learning-rate "$lr" --grad-checkpoint \
             2>&1 | tee "$MLX3_LOGS/dwq-$tag.log"
     fi
@@ -1364,32 +1401,46 @@ print("vision build : %d tensors" % len(vw))
 if not tw or not vw:
     sys.exit(1)
 
-sample = sorted(tw.keys())[len(tw) // 2]
-tail = sample.split(".", 1)[1] if "." in sample else sample
-cands = [k for k in vw if k.endswith(tail)]
-if not cands:
-    print("cannot match names. text sample %s" % sample)
-    print("                   vlm  sample %s" % sorted(vw.keys())[len(vw) // 2])
-    sys.exit(1)
-prefix = cands[0][: len(cands[0]) - len(tail)]
-print("language prefix in the vlm build: %r" % prefix)
-
+# Exact names first. mlx_lm writes the same keys it read, including the
+# language_model. prefix, so the two builds line up one to one. An earlier
+# version detected that prefix and stripped it before looking the name up,
+# which matched nothing: it reported "replaced 0, not found 1847" and wrote out
+# the untouched base with a new quantization block. That file was published.
+# Anything that replaces nothing now stops instead of writing.
 merged = {}
 rep = kept = 0
-missing = []
 for k, v in vw.items():
-    if k.startswith(prefix):
-        src = k[len(prefix):]
-        if src in tw:
-            merged[k] = tw[src]; rep += 1
-        else:
-            merged[k] = v; missing.append(src)
+    if k in tw:
+        merged[k] = tw[k]; rep += 1
     else:
         merged[k] = v; kept += 1
+
+if rep == 0:
+    # Fallback for a text build whose names really are prefix free.
+    sample = sorted(tw.keys())[len(tw) // 2]
+    cands = [k for k in vw if k.endswith("." + sample) or k.endswith(sample)]
+    if cands:
+        prefix = cands[0][: len(cands[0]) - len(sample)]
+        print("no exact matches, trying prefix %r" % prefix)
+        merged = {}
+        rep = kept = 0
+        for k, v in vw.items():
+            src = k[len(prefix):] if k.startswith(prefix) else None
+            if src is not None and src in tw:
+                merged[k] = tw[src]; rep += 1
+            else:
+                merged[k] = v; kept += 1
+
 print("replaced from the text build : %d" % rep)
 print("kept from the vlm build      : %d" % kept)
-if missing:
-    print("not found, kept as they were : %d" % len(missing))
+if rep == 0:
+    print()
+    print("NOTHING WAS REPLACED, refusing to write. The output would be the")
+    print("vision build with a different quantization block, which looks like")
+    print("a result and is not one.")
+    print("  text sample: %s" % sorted(tw.keys())[len(tw) // 2])
+    print("  vlm  sample: %s" % sorted(vw.keys())[len(vw) // 2])
+    sys.exit(1)
 
 os.makedirs(out_p, exist_ok=True)
 for f in glob.glob(os.path.join(vis_p, "*")):
@@ -1452,8 +1503,13 @@ mlx3_push() {
         return 1
     fi
     echo "$d  ->  $repo   ($(du -sh $d | cut -f1))"
-    read -p "upload? [y/N] " a
-    [ "$a" = "y" ] || return 1
+    # This used to prompt by default. A sequence left running overnight then
+    # stopped on the first upload and nothing after it ran. The prompt is now
+    # opt in: MLX3_ASK=1 brings it back. Nothing else in this file blocks.
+    if [ "$MLX3_ASK" = "1" ]; then
+        read -p "upload? [y/N] " a
+        [ "$a" = "y" ] || return 1
+    fi
     python3 - "$d" "$repo" << 'PUSHEOF'
 import sys
 from huggingface_hub import HfApi
