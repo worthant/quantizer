@@ -28,7 +28,7 @@
 # Two methods are used and nothing else. Both are explained where they are
 # defined. mlx3_plan prints the arithmetic behind every expected number.
 
-MLX3_VERSION=2026-08-25.01
+MLX3_VERSION=2026-08-25.04
 
 MLX3_UP=${MLX3_UP:-Qwen/Qwen3.8-27B}
 MLX3_ORG=${MLX3_ORG:-AtomicChat}
@@ -482,7 +482,8 @@ mlx3_kld() {
     local n
     n=$(basename "${q%/}")
     stdbuf -oL -eL python3 /mlx3_kld.py "$MLX3_CACHE" "${q%/}" \
-        "$MLX3_LOGS/kld-$n.json" "$MLX3_TAIL" 2>&1 | tee "$MLX3_LOGS/kld-$n.log"
+        "$MLX3_LOGS/kld-$n.json" "$MLX3_TAIL" "${MLX3_QUICK:-0}" \
+        2>&1 | tee "$MLX3_LOGS/kld-$n.log"
     mlx3_upload "$MLX3_LOGS/kld-$n.json" "logs/kld-$n.json"
     mlx3_upload "$MLX3_LOGS/kld-$n.log" "logs/kld-$n.log"
 }
@@ -850,7 +851,8 @@ mlx3_quant() {
         --quant-method rtn 2>&1 | tee "$MLX3_LOGS/convert-$label.log"
     rc=${PIPESTATUS[0]}
     echo "took $(( $(date +%s) - start )) seconds"
-    if [ "$rc" != "0" ]; then
+    if [ ! -f "$out/config.json" ] || ! ls "$out"/*.safetensors > /dev/null 2>&1; then
+        echo "nothing usable came out (exit code was $rc), removing the remains"
         rm -rf "$out"
         return 1
     fi
@@ -926,8 +928,8 @@ mlx3_clip() {
         2>&1 | tee "$MLX3_LOGS/clip-$(basename $tmpl).log"
     rc=${PIPESTATUS[0]}
     echo "took $(( $(date +%s) - start )) seconds"
-    if [ "$rc" != "0" ]; then
-        echo "failed, removing the partial output"
+    if [ ! -f "$out/config.json" ] || ! ls "$out"/*.safetensors > /dev/null 2>&1; then
+        echo "nothing usable came out (exit code was $rc), removing the remains"
         rm -rf "$out"
         return 1
     fi
@@ -937,6 +939,261 @@ mlx3_clip() {
     echo "the two sizes above must match. Then:  mlx3_kld $out"
 }
 
+
+# ================================================================== layout
+
+# The lever we spent two days not pulling. Clipping and distillation together
+# move the divergence by two to five percent. A bit layout moves it by twenty.
+#
+# WHAT A LAYOUT IS. Every tensor gets its own bit count and group size instead
+# of one setting for the whole model. Some roles are tiny and very sensitive,
+# some are huge and tolerant, and the whole game is moving bits from the second
+# kind to the first.
+#
+# THE ARITHMETIC, for this model, 26.893 B text parameters. A plain 3 bit
+# group 64 build is 12.69 GB. Cost of lifting a role by one bit:
+#
+#   gate_proj, up_proj, down_proj   713 MB each      21.2 % of the model each
+#   in_proj_qkv                     315 MB            9.4 %
+#   in_proj_z, out_proj             189 MB            5.6 % each
+#   embed_tokens, lm_head           159 MB            4.7 % each
+#   q_proj                          126 MB            3.7 %
+#   o_proj                           63 MB            1.9 %
+#   k_proj, v_proj                   10 MB            0.3 % each
+#   in_proj_a, in_proj_b              1.5 MB          0.04 % each
+#
+# And where the money comes from: embed_tokens from 3/64 to 2/128 frees
+# 198 MB, gate_proj to group 128 frees 178 MB. A lookup error stays inside one
+# token, which is why the vocabulary matrices are the right place to save.
+#
+# mlx3_price says what a rule set costs before anything is built, the way the
+# GGUF side uses bits before quantize. mlx3_build then builds it out of the
+# bf16 weights with the same clipping search mlx3_clip uses.
+
+MLX3_RULES=${MLX3_RULES:-/mlx3-rules.txt}
+
+# Writes the default rule set: AD-3.8, 13.67 GB, aimed just under maglun's
+# 13.70 GB build. First match wins, so order matters.
+mlx3_rules() {
+    cat > "$MLX3_RULES" << 'RULESEOF'
+# regex matched against the tensor name          bits  group
+# first match wins, so the catch all goes last
+# "skip" leaves the tensor in bf16 and records it as unquantized
+
+# 0.04 percent of the model each, and the worst clipping error of any role.
+# Full precision costs 37 MB for both.
+\.in_proj_a\.weight$                              skip
+\.in_proj_b\.weight$                              skip
+
+# 0.3 percent each, ten megabytes per bit. Cheapest sensitive thing there is.
+self_attn\.(k|v)_proj\.weight$                    8     64
+
+# 9.4 percent of the model between them. A lookup error stays inside one
+# token, so this is where the budget comes from rather than goes.
+embed_tokens\.weight$                             2     128
+lm_head\.weight$                                  3     128
+
+self_attn\.(q|o)_proj\.weight$                    5     64
+
+# The recurrent path. The GGUF ladder found ssm_out among the most valuable
+# tensors in the model and maglun does not lift it at all.
+linear_attn\.out_proj\.weight$                    5     64
+linear_attn\.in_proj_(qkv|z)\.weight$             4     64
+
+# 21.2 percent each. gate_proj pays for the rest by going to group 128.
+mlp\.gate_proj\.weight$                           3     128
+mlp\.up_proj\.weight$                             3     64
+mlp\.down_proj\.weight$                           3     64
+
+.*                                                3     64
+RULESEOF
+    echo "wrote $MLX3_RULES"
+    echo
+    echo "price it before building:  mlx3_price"
+}
+
+mlx3_price() {
+    local rules="${1:-$MLX3_RULES}"
+    if [ ! -f "$rules" ]; then
+        echo "no rules at $rules. Run:  mlx3_rules"
+        return 1
+    fi
+    if [ ! -f "$MLX3_REF/config.json" ]; then
+        echo "no bf16 weights at $MLX3_REF. Run:  mlx3_get ref"
+        return 1
+    fi
+    mlx3_write_py > /dev/null
+    python3 /mlx3_layout.py price "$MLX3_REF" "$rules"
+}
+
+# mlx3_gen TARGET_GB [RULES_FILE]
+#
+# Writes a rule set that lands on a target size. The shape is fixed and only
+# the level moves, so a sweep compares sizes rather than a hundred unrelated
+# ideas. What the shape says, and every line of it is something we measured:
+#
+#   k_proj, v_proj at 8 bits      0.3 percent of the model, 10 MB per bit, and
+#                                 the worst clipping error of any large role
+#   in_proj_a, in_proj_b in bf16  0.04 percent each, worst error in the model
+#   q, o                          two bits above the base
+#   out_proj, in_proj_qkv, z      one bit above
+#   down_proj, up_proj, gate_proj the base, and they are 21 percent each, so
+#                                 the two lift counts below are the fine knob
+#   embed_tokens, lm_head         group 128, a lookup error stays local
+#
+# Two lift counts give the granularity: how many of the 64 layers get
+# down_proj two bits above the base, and up_proj one bit above. The search
+# picks the combination closest to the target.
+#
+#   mlx3_gen 13.7 && mlx3_try AD-13.7
+mlx3_gen() {
+    if [ -z "$1" ]; then
+        echo "mlx3_gen TARGET_GB [RULES_FILE]"
+        echo "  mlx3_gen 10.5      the 16 GB Mac class"
+        echo "  mlx3_gen 13.7      the 24 GB Mac class"
+        echo "  mlx3_gen 17.4      the 32 GB Mac class"
+        return 1
+    fi
+    python3 - "$1" "${2:-$MLX3_RULES}" << 'GENEOF'
+import sys
+H, I, V, L, F, N = 5120, 17408, 248320, 64, 16, 48
+ROLE = {"embed_tokens": V*H, "lm_head": V*H, "gate": L*I*H, "up": L*I*H,
+        "down": L*H*I, "q": F*12288*H, "k": F*1024*H, "v": F*1024*H,
+        "o": F*H*6144, "ia": N*48*H, "ib": N*48*H, "qkv": N*10240*H,
+        "z": N*6144*H, "out": N*H*6144}
+
+def w(b, g):
+    return 16.0 if b is None else b + 32.0 / g
+
+def cl(b):
+    return max(2, min(8, b))
+
+def spec(base, emb, gg):
+    return {"k": (8, 64), "v": (8, 64), "ia": (None, 0), "ib": (None, 0),
+            "q": (cl(base+2), 64), "o": (cl(base+2), 64),
+            "out": (cl(base+1), 64), "qkv": (cl(base+1), 64), "z": (cl(base+1), 64),
+            "down": (cl(base), 64), "up": (cl(base), 64), "gate": (cl(base), gg),
+            "embed_tokens": (cl(base+emb), 128), "lm_head": (cl(base+emb), 128)}
+
+def size(s, de, ue):
+    t = 0.0
+    for k, n in ROLE.items():
+        b, g = s[k]
+        per = n / L
+        if k == "down" and de:
+            t += de*per*w(cl(b+2), g)/8 + (L-de)*per*w(b, g)/8
+        elif k == "up" and ue:
+            t += ue*per*w(cl(b+1), g)/8 + (L-ue)*per*w(b, g)/8
+        else:
+            t += n*w(b, g)/8
+    return 0.92 + t/1e9
+
+target, out = float(sys.argv[1]), sys.argv[2]
+best = None
+for base in range(2, 7):
+    for emb in (-1, 0, 1):
+        for gg in (64, 128):
+            s = spec(base, emb, gg)
+            for de in range(0, 65, 4):
+                for ue in range(0, 65, 4):
+                    z = size(s, de, ue)
+                    d = abs(z - target)
+                    if best is None or d < best[0]:
+                        best = (d, z, base, emb, gg, de, ue, s)
+_, z, base, emb, gg, de, ue, s = best
+
+def edge(n):
+    """The n layers at the two ends, as a regex alternation."""
+    half = n // 2
+    ids = list(range(half)) + list(range(L - (n - half), L))
+    return "|".join(str(i) for i in ids)
+
+lines = [
+    "# generated by mlx3_gen for %.2f GB, lands on %.2f" % (target, z),
+    "# base %d bits, embed offset %+d, gate group %d, down lift %d layers, up lift %d"
+    % (base, emb, gg, de, ue),
+    r"\.in_proj_a\.weight$                              skip",
+    r"\.in_proj_b\.weight$                              skip",
+    r"self_attn\.(k|v)_proj\.weight$                    8     64",
+]
+if de:
+    lines.append(r"layers\.(%s)\.mlp\.down_proj\.weight$   %d  64" % (edge(de), cl(s["down"][0]+2)))
+if ue:
+    lines.append(r"layers\.(%s)\.mlp\.up_proj\.weight$     %d  64" % (edge(ue), cl(s["up"][0]+1)))
+lines += [
+    r"embed_tokens\.weight$                             %d    128" % s["embed_tokens"][0],
+    r"lm_head\.weight$                                  %d    128" % s["lm_head"][0],
+    r"self_attn\.(q|o)_proj\.weight$                    %d    64" % s["q"][0],
+    r"linear_attn\.(out_proj|in_proj_qkv|in_proj_z)\.weight$   %d  64" % s["out"][0],
+    r"mlp\.gate_proj\.weight$                           %d    %d" % (s["gate"][0], gg),
+    r"mlp\.up_proj\.weight$                             %d    64" % s["up"][0],
+    r"mlp\.down_proj\.weight$                           %d    64" % s["down"][0],
+    r".*                                                %d    64" % s["down"][0],
+]
+open(out, "w").write("\n".join(lines) + "\n")
+print("wrote %s" % out)
+print("target %.2f GB, this layout is %.2f GB" % (target, z))
+print("base %d bits, embed %+d, gate group %d, down lift %d, up lift %d"
+      % (base, emb, gg, de, ue))
+GENEOF
+}
+
+# mlx3_try LABEL [RULES]
+# Build a layout and rank it on six chunks instead of twenty four. Under two
+# minutes of card time per candidate, against an hour for a distillation run.
+# Sweep layouts first, distil the winner last.
+mlx3_try() {
+    if [ -z "$1" ]; then
+        echo "mlx3_try LABEL [RULES]"
+        return 1
+    fi
+    mlx3_build "$1" "${2:-$MLX3_RULES}" || return 1
+    MLX3_QUICK=${MLX3_QUICK:-6} mlx3_kld "$MLX3_ROOT/$MLX3_STEM-MLX-$1"
+}
+
+# mlx3_build LABEL [RULES]
+mlx3_build() {
+    if [ -z "$1" ]; then
+        echo "mlx3_build LABEL [RULES]"
+        echo "  mlx3_rules ; mlx3_price ; mlx3_build AD-3.8"
+        return 1
+    fi
+    local label="$1"
+    local rules="${2:-$MLX3_RULES}"
+    local out="$MLX3_ROOT/$MLX3_STEM-MLX-$label"
+    if [ ! -f "$rules" ]; then
+        echo "no rules at $rules. Run:  mlx3_rules"
+        return 1
+    fi
+    if [ ! -f "$MLX3_REF/config.json" ]; then
+        echo "no bf16 weights at $MLX3_REF. Run:  mlx3_get ref"
+        return 1
+    fi
+    mlx3_write_py > /dev/null
+    echo "rules  : $rules"
+    echo "weights: $MLX3_REF"
+    echo "target : $out"
+    python3 /mlx3_layout.py price "$MLX3_REF" "$rules"
+    echo
+    date
+    local start rc
+    start=$(date +%s)
+    rm -rf "$out"
+    stdbuf -oL -eL python3 /mlx3_layout.py build "$MLX3_REF" "$rules" "$out" \
+        "$MLX3_ALPHAS" 2>&1 | tee "$MLX3_LOGS/build-$label.log"
+    rc=${PIPESTATUS[0]}
+    echo "took $(( $(date +%s) - start )) seconds"
+    # Not the exit code: the CUDA backend can throw from a destructor after the
+    # work is finished, and a finished checkpoint was once deleted for it.
+    if [ ! -f "$out/config.json" ] || ! ls "$out"/*.safetensors > /dev/null 2>&1; then
+        echo "nothing usable came out (exit code was $rc), removing the remains"
+        rm -rf "$out"
+        return 1
+    fi
+    du -sh "$out"
+    echo
+    echo "measure it:  mlx3_kld $out"
+}
 
 # ================================================================== method 2: distillation
 
@@ -1463,6 +1720,8 @@ size = os.path.getsize(os.path.join(out_p, "model.safetensors"))
 print()
 print("wrote %s, %.2f GB" % (out_p, size / 1e9))
 print("now load it and show it a picture. Until then this is a claim.")
+sys.stdout.flush()
+os._exit(0)
 REATTEOF
 }
 
@@ -1536,7 +1795,7 @@ cat > /mlx3_refcache.py << 'RCEOF'
 
     python3 mlx3_refcache.py REF CORPUS CTX FIRST STEP MAX_CHUNKS OUT_PREFIX
 """
-import json, sys
+import json, os, sys
 import mlx.core as mx
 import numpy as np
 from mlx_lm import load
@@ -1579,6 +1838,17 @@ json.dump({"reference": ref, "ids": ids[:n_chunk * ctx], "ctx": ctx,
            "first": first, "step": step, "chunks": n_chunk, "per_chunk": per,
            "vocab": vocab, "rows": rows}, open(out + ".json", "w"))
 print("done, %d rows" % w)
+
+# The MLX CUDA backend throws from a destructor at interpreter shutdown:
+#   terminate called ... Destroy(handle_) failed: driver shutting down
+# It happens after all the work is done, but it aborts the process and the
+# shell then sees a non zero exit code. That cost one finished 13.68 GB
+# checkpoint, deleted by a cleanup branch that trusted the code. Leaving here
+# without unwinding skips the destructors entirely.
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)
+
 RCEOF
 
 cat > /mlx3_kld.py << 'K3EOF'
@@ -1598,17 +1868,23 @@ Definitions follow llama.cpp's llama-perplexity --kl-divergence:
 TAIL_CUTOFF=1 also applies llama.cpp's `if (p_log_base > -16.f)`. Both numbers
 are printed so the size of that difference is visible rather than argued about.
 """
-import json, math, sys, time
+import json, math, os, sys, time
 import mlx.core as mx
 import numpy as np
 from mlx_lm import load
 
 cache, qnt_path, out_json = sys.argv[1:4]
 tail = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+# Screening mode. A layout sweep needs a ranking, not a publishable number,
+# and six of the twenty four chunks give the same ordering in a quarter of the
+# time. Anything that goes in a table or a card is measured on all of them.
+quick = int(sys.argv[5]) if len(sys.argv) > 5 else 0
 
 meta = json.load(open(cache + ".json"))
 ctx, first, step = meta["ctx"], meta["first"], meta["step"]
 vocab, ids, n_chunk = meta["vocab"], meta["ids"], meta["chunks"]
+if quick and quick < n_chunk:
+    n_chunk = quick
 mm = np.memmap(cache + ".f16", dtype=np.float16, mode="r",
                shape=(meta["rows"], vocab))
 
@@ -1616,6 +1892,8 @@ print("reference : %s (cached)" % meta["reference"], flush=True)
 print("quant     : %s" % qnt_path, flush=True)
 print("context   : %d, from %d, %d chunks, tail cutoff %s"
       % (ctx, first, n_chunk, "on" if tail else "off"), flush=True)
+if quick:
+    print("SCREENING on %d chunks, not for publication" % n_chunk, flush=True)
 
 model, _ = load(qnt_path)
 
@@ -1668,6 +1946,7 @@ q = lambda f: klds[min(len(klds) - 1, int(len(klds) * f))]
 rms = lambda v: math.sqrt(sum(x * x for x in v) / len(v))
 res = {"reference": meta["reference"], "quant": qnt_path, "context": ctx,
        "score_from": first, "chunks": n_chunk, "tokens_scored": scored,
+       "screening": bool(quick),
        "tail_cutoff": bool(tail),
        "reference_ppl": math.exp(nll_ref / scored),
        "quant_ppl": math.exp(nll_qnt / scored),
@@ -1691,6 +1970,17 @@ print("quant ppl     : %.4f  (reference %.4f)"
 print("delta p pts   : mean %.4f  rms %.4f"
       % (res["mean_delta_p_points"], res["rms_delta_p_points"]))
 print("written to %s" % out_json)
+
+# The MLX CUDA backend throws from a destructor at interpreter shutdown:
+#   terminate called ... Destroy(handle_) failed: driver shutting down
+# It happens after all the work is done, but it aborts the process and the
+# shell then sees a non zero exit code. That cost one finished 13.68 GB
+# checkpoint, deleted by a cleanup branch that trusted the code. Leaving here
+# without unwinding skips the destructors entirely.
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)
+
 K3EOF
 
 cat > /mlx3_clip.py << 'CLIPEOF'
@@ -1923,9 +2213,319 @@ else:
     print("The weights are measurably closer to the originals. Whether that")
     print("survives sixty four layers of composition is what mlx3_kld answers,")
     print("and nothing before it does.")
+
+
+# The MLX CUDA backend throws from a destructor at interpreter shutdown:
+#   terminate called ... Destroy(handle_) failed: driver shutting down
+# It happens after all the work is done, but it aborts the process and the
+# shell then sees a non zero exit code. That cost one finished 13.68 GB
+# checkpoint, deleted by a cleanup branch that trusted the code. Leaving here
+# without unwinding skips the destructors entirely.
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)
+
 CLIPEOF
 
-    echo "wrote /mlx3_refcache.py /mlx3_kld.py /mlx3_clip.py"
+
+cat > /mlx3_layout.py << 'LAYEOF'
+"""Build a quantized MLX checkpoint from a per tensor rule set.
+
+    python3 mlx3_layout.py price BF16_DIR RULES
+    python3 mlx3_layout.py build BF16_DIR RULES OUT "1.000 0.995 ..."
+
+A rule line is a regex, a bit count and a group size, or the word skip. The
+first rule whose regex matches the tensor name wins, so the catch all goes
+last. Anything skipped, and anything outside the language model, stays in
+bf16 and is recorded as unquantized in the config so the loader does not try
+to dequantize it.
+
+Numbers come out of the same clipping search mlx3_clip uses: for each group of
+weights, try several narrower ranges, keep the one with the smallest squared
+error, and let mx.quantize do the packing.
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import struct
+import sys
+import time
+
+import mlx.core as mx
+
+SHARD_BYTES = 4_500_000_000
+
+
+def st_info(path):
+    """Names, shapes and dtypes from the safetensors header, no data read."""
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        head = json.loads(f.read(n))
+    out = {}
+    for k, v in head.items():
+        if k == "__metadata__":
+            continue
+        out[k] = (tuple(v["shape"]), v["dtype"])
+    return out
+
+
+def read_rules(path):
+    rules = []
+    for line in open(path, encoding="utf-8"):
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lower() == "skip":
+            rules.append((re.compile(parts[0]), None, None))
+        elif len(parts) == 3:
+            rules.append((re.compile(parts[0]), int(parts[1]), int(parts[2])))
+        else:
+            sys.exit("cannot read this rule line: %r" % line)
+    if not rules:
+        sys.exit("no rules in %s" % path)
+    return rules
+
+
+def decide(name, shape, rules):
+    """(bits, group) or None for a tensor that stays in bf16."""
+    if len(shape) != 2 or not name.endswith(".weight"):
+        return None
+    if not name.startswith("language_model."):
+        return None                      # the vision tower is never touched
+    for rx, bits, group in rules:
+        if rx.search(name):
+            if bits is None:
+                return None
+            if shape[1] % group != 0:
+                return None
+            return (bits, group)
+    return None
+
+
+def role_of(name):
+    r = re.sub(r"layers\.\d+\.", "", name)
+    r = r.replace("language_model.model.", "").replace("language_model.", "")
+    return r.replace(".weight", "")
+
+
+def scan(ref, rules):
+    """Every tensor with its shape and its decision, in file order."""
+    files = sorted(glob.glob(os.path.join(ref, "*.safetensors")))
+    items = []
+    for f in files:
+        for name, (shape, dtype) in st_info(f).items():
+            items.append((name, shape, f, decide(name, shape, rules)))
+    return items
+
+
+def price(ref, rules):
+    items = scan(ref, rules)
+    roles = {}
+    total_bits = 0
+    quantized = 0
+    for name, shape, _f, d in items:
+        n = 1
+        for x in shape:
+            n *= x
+        bpw = 16.0 if d is None else d[0] + 32.0 / d[1]
+        total_bits += n * bpw
+        if d is not None:
+            quantized += 1
+        key = role_of(name)
+        e = roles.setdefault(key, {"n": 0, "bits": 0.0, "how": {}})
+        e["n"] += n
+        e["bits"] += n * bpw
+        e["how"][("bf16" if d is None else "%d/%d" % d)] = \
+            e["how"].get("bf16" if d is None else "%d/%d" % d, 0) + 1
+
+    params = sum(e["n"] for e in roles.values())
+    print()
+    print("%-30s %14s %7s  %-18s %8s" %
+          ("role", "params", "share", "bits/group", "GB"))
+    for k, e in sorted(roles.items(), key=lambda kv: -kv[1]["bits"]):
+        how = " ".join("%s x%d" % (a, b) for a, b in sorted(e["how"].items()))
+        print("%-30s %14d %6.2f%%  %-18s %8.3f" %
+              (k, e["n"], 100.0 * e["n"] / params, how[:18], e["bits"] / 8 / 1e9))
+    print("-" * 82)
+    gb = total_bits / 8 / 1e9
+    print("%-30s %14d %6.2f%%  %-18s %8.3f" %
+          ("TOTAL", params, 100.0, "%.3f bpw" % (total_bits / params), gb))
+    print()
+    print("quantized tensors: %d of %d" % (quantized, len(items)))
+    print("what to compare against, measured on one reference:")
+    print("  12.69 GB  0.222903  plain 3 bit group 64")
+    print("  13.37 GB  0.165901  our mixed_3_4 with clipping and distillation")
+    print("  13.70 GB  0.154161  maglun Mixed-3.80bpw")
+    print("  16.05 GB  0.053267  our 4bit with clipping and distillation")
+    print("  17.57 GB  0.034350  maglun Mixed-4.95bpw")
+    return gb
+
+
+def build(ref, rules, out, alphas):
+    items = scan(ref, rules)
+    n_q = sum(1 for i in items if i[3] is not None)
+    print("tensors: %d, to quantize: %d" % (len(items), n_q), flush=True)
+
+    os.makedirs(out, exist_ok=True)
+    for f in sorted(glob.glob(os.path.join(ref, "*"))):
+        if f.endswith(".safetensors") or f.endswith(".safetensors.index.json"):
+            continue
+        if os.path.isfile(f):
+            shutil.copy2(f, out)
+
+    cfg = json.load(open(os.path.join(ref, "config.json")))
+    quant = {"group_size": 64, "bits": 3, "mode": "affine"}
+
+    cache_path, cache = None, {}
+    shard, shard_bytes, shard_no = {}, 0, 1
+    weight_map, written = {}, []
+    done, err_base, err_best = 0, 0.0, 0.0
+    t0 = time.time()
+
+    def flush():
+        nonlocal shard, shard_bytes, shard_no
+        if not shard:
+            return
+        name = "model-%05d-of-SHARDS.safetensors" % shard_no
+        mx.save_safetensors(os.path.join(out, name), shard,
+                            metadata={"format": "mlx"})
+        for k in shard:
+            weight_map[k] = name
+        written.append(name)
+        print("  wrote %s, %.2f GB" % (name, shard_bytes / 1e9), flush=True)
+        shard, shard_bytes, shard_no = {}, 0, shard_no + 1
+
+    for name, shape, f, d in items:
+        if f != cache_path:
+            cache = mx.load(f)
+            cache_path = f
+        w = cache[name]
+
+        if d is None:
+            shard[name] = w
+            shard_bytes += w.nbytes
+            if len(shape) == 2 and name.endswith(".weight"):
+                quant[name[: -len(".weight")]] = False
+        else:
+            bits, group = d
+            rows, cols = int(shape[0]), int(shape[1])
+            w32 = w.astype(mx.float32)
+            g = w32.reshape(-1, group)
+            lo = mx.min(g, axis=1, keepdims=True)
+            hi = mx.max(g, axis=1, keepdims=True)
+            mid = (lo + hi) / 2.0
+            half = (hi - lo) / 2.0
+
+            best_err = best_a = err_one = None
+            for a in alphas:
+                av = mx.array(a, dtype=mx.float32)
+                cw = mx.clip(g, mid - half * av, mid + half * av)
+                cw = cw.reshape(rows, cols).astype(w.dtype)
+                q, sc, bi = mx.quantize(cw, group_size=group, bits=bits)
+                dq = mx.dequantize(q, sc, bi, group_size=group, bits=bits)
+                diff = (dq.astype(mx.float32) - w32).reshape(-1, group)
+                e = mx.sum(diff * diff, axis=1, keepdims=True)
+                mx.eval(e)
+                if a == 1.0:
+                    err_one = e
+                if best_err is None:
+                    best_err = e
+                    best_a = mx.full(e.shape, a, dtype=mx.float32)
+                else:
+                    take = e < best_err
+                    best_err = mx.where(take, e, best_err)
+                    best_a = mx.where(take, av, best_a)
+                del cw, q, sc, bi, dq, diff, e
+
+            cw = mx.clip(g, mid - half * best_a, mid + half * best_a)
+            cw = cw.reshape(rows, cols).astype(w.dtype)
+            q, sc, bi = mx.quantize(cw, group_size=group, bits=bits)
+            mx.eval(q, sc, bi)
+
+            base = name[: -len(".weight")]
+            shard[base + ".weight"] = q
+            shard[base + ".scales"] = sc
+            shard[base + ".biases"] = bi
+            shard_bytes += q.nbytes + sc.nbytes + bi.nbytes
+            quant[base] = {"group_size": group, "bits": bits}
+
+            e1, e2 = float(mx.sum(err_one)), float(mx.sum(best_err))
+            err_base += e1
+            err_best += e2
+            done += 1
+            el = time.time() - t0
+            eta = (n_q - done) * el / done
+            print("  [%3d/%3d] %-42s %5dx%-5d b%d g%-3d err %+6.2f %% a=%.3f eta %dm%02ds"
+                  % (done, n_q, base[-42:], rows, cols, bits, group,
+                     0.0 if e1 == 0 else 100.0 * (e2 - e1) / e1,
+                     float(mx.mean(best_a)), eta // 60, eta % 60), flush=True)
+            del w32, g, lo, hi, mid, half, best_err, best_a, err_one, cw, q, sc, bi
+
+        if shard_bytes >= SHARD_BYTES:
+            flush()
+    flush()
+
+    # the shard count is only known at the end, so the names are fixed up here
+    total = len(written)
+    for i, old in enumerate(written, 1):
+        new = "model-%05d-of-%05d.safetensors" % (i, total)
+        os.rename(os.path.join(out, old), os.path.join(out, new))
+        for k, v in weight_map.items():
+            if v == old:
+                weight_map[k] = new
+
+    size = sum(os.path.getsize(p) for p in glob.glob(os.path.join(out, "*.safetensors")))
+    json.dump({"metadata": {"total_size": size}, "weight_map": weight_map},
+              open(os.path.join(out, "model.safetensors.index.json"), "w"), indent=2)
+
+    cfg["quantization"] = quant
+    if "text_config" in cfg and isinstance(cfg["text_config"], dict):
+        cfg["text_config"]["quantization"] = quant
+    json.dump(cfg, open(os.path.join(out, "config.json"), "w"), indent=2)
+
+    print()
+    print("rebuilt      : %d tensors in %d shards" % (done, total))
+    print("squared error: %+.3f percent against plain min max rounding"
+          % (0.0 if err_base == 0 else 100.0 * (err_best - err_base) / err_base))
+    print("on disk      : %.2f GB" % (size / 1e9))
+
+
+def main():
+    mode = sys.argv[1]
+    if mode == "price":
+        price(sys.argv[2], read_rules(sys.argv[3]))
+    elif mode == "build":
+        alphas = [float(a) for a in sys.argv[5].split()]
+        if 1.0 not in alphas:
+            alphas.insert(0, 1.0)
+        rules = read_rules(sys.argv[3])
+        price(sys.argv[2], rules)
+        print()
+        build(sys.argv[2], rules, sys.argv[4], alphas)
+    else:
+        sys.exit("price or build")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# The MLX CUDA backend throws from a destructor at interpreter shutdown:
+#   terminate called ... Destroy(handle_) failed: driver shutting down
+# It happens after all the work is done, but it aborts the process and the
+# shell then sees a non zero exit code. That cost one finished 13.68 GB
+# checkpoint, deleted by a cleanup branch that trusted the code. Leaving here
+# without unwinding skips the destructors entirely.
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)
+
+LAYEOF
+
+    echo "wrote /mlx3_refcache.py /mlx3_kld.py /mlx3_clip.py /mlx3_layout.py"
 }
 
 
@@ -2166,6 +2766,11 @@ MEASURE   mlx3_cache | mlx3_kld DIR | mlx3_all | mlx3_table
 HANDOFF   mlx3_wait LABEL               poll the hub for a base, then pull it
 CHECKS    mlx3_verify | mlx3_fp_remote | mlx3_fingerprint DIR
           mlx3_repeat DIR | mlx3_tail
+LAYOUT    mlx3_gen TARGET_GB             a rule set that lands on a size
+          mlx3_try LABEL                 build and rank on six chunks
+          mlx3_rules                     the hand written default
+          mlx3_price [RULES]             what it costs, before building
+          mlx3_build LABEL [RULES]       build it from bf16 with clipping
 BUILD     mlx3_quant BITS [GROUP]        plain rung, needs /src
           mlx3_clip TEMPLATE [SUFFIX]    better rounding, identical size
 DISTILL   mlx3_mem BITS GROUP SEQ [full|targets]
