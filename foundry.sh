@@ -6265,6 +6265,229 @@ mlx_audit() {
     echo "context             : $Q_CTX, scoring from ${Q_FIRST:-half of it}"
 }
 
+# ================================================================== probe
+#
+# Everything about a new model that can be known before renting anything.
+#
+# Reads the config, the tokenizer files and the SAFETENSORS HEADERS. A
+# safetensors file starts with eight bytes holding the length of a json header,
+# and that header lists every tensor with its dtype and its shape. Two HTTP
+# range requests per shard therefore give the complete tensor layout of a 360 GB
+# checkpoint for a few megabytes, which is the difference between knowing what
+# the ladder will cost and guessing at it.
+#
+#   probe_arch Qwen/Qwen3.8-Flash-Next
+#
+# What to read out of the output, in order:
+#   1. architectures     -> does the converter know this class at all
+#   2. auto_map          -> if present the model ships its own modeling code,
+#                           so transformers works today and the NVFP4 and MLX
+#                           routes are open even while llama.cpp is not
+#   3. dtype             -> bf16 or an already quantized checkpoint
+#   4. the tensor table  -> where the parameters actually are, which decides
+#                           the ladder and what imatrix can and cannot reach
+probe_arch() {
+    if [ -z "$1" ]; then
+        echo "probe_arch UPSTREAM_REPO"
+        echo "  probe_arch Qwen/Qwen3.8-Flash-Next"
+        return 1
+    fi
+    local repo="$1" dir=/probe
+    mkdir -p $dir /logs
+
+    echo "=============== 1. small files only, no weights ==============="
+    hf download "$repo" --local-dir $dir \
+        --include "*.json" --include "*.py" --include "*.jinja" --include "*.md" \
+        || return 1
+    du -sh $dir
+    echo
+    ls $dir
+
+    echo
+    echo "=============== 2. what this model says it is ==============="
+    python3 - "$repo" "$dir" 2>&1 | tee /logs/probe-$(basename $repo).log << 'PROBEEOF'
+import json, os, sys, collections
+
+repo, d = sys.argv[1], sys.argv[2]
+cfg = json.load(open(os.path.join(d, "config.json")))
+inner = cfg.get("text_config") or cfg
+
+arch = cfg.get("architectures") or ["UNKNOWN"]
+print("architectures : %s" % ", ".join(arch))
+print("model_type    : %s" % cfg.get("model_type"))
+print("dtype         : %s" % (cfg.get("torch_dtype") or cfg.get("dtype")))
+print("quantization  : %s" % (cfg.get("quantization_config") or "none, full precision"))
+
+auto = cfg.get("auto_map")
+py = [f for f in os.listdir(d) if f.endswith(".py")]
+print()
+if auto or py:
+    print("CUSTOM CODE   : yes")
+    for k, v in (auto or {}).items():
+        print("   %-34s %s" % (k, v))
+    for f in sorted(py):
+        print("   ships %s" % f)
+    print("   transformers runs this today with trust_remote_code=True, so the")
+    print("   NVFP4 and MLX routes do not wait on llama.cpp.")
+else:
+    print("CUSTOM CODE   : no, this needs a transformers release that knows it")
+
+print()
+print("--- shape of the network ---")
+for k in ("num_hidden_layers", "hidden_size", "intermediate_size",
+          "moe_intermediate_size", "num_experts", "num_experts_per_tok",
+          "num_attention_heads", "num_key_value_heads", "head_dim",
+          "vocab_size", "max_position_embeddings", "full_attention_interval",
+          "linear_conv_kernel_dim", "num_nextn_predict_layers"):
+    v = inner.get(k, cfg.get(k))
+    if v is not None:
+        extra = ""
+        if k in ("hidden_size", "intermediate_size", "moe_intermediate_size"):
+            extra = "   %%256 = %d %s" % (v % 256,
+                     "ok" if v % 256 == 0 else "<- BREAKS k/i quants below 4.5 bpw")
+        print("  %-26s %s%s" % (k, v, extra))
+
+print()
+print("--- anything n-gram, residual or sparse-attention shaped ---")
+hits = 0
+def walk(node, path=""):
+    global hits
+    if isinstance(node, dict):
+        for k, v in node.items():
+            p = "%s.%s" % (path, k) if path else k
+            if any(t in k.lower() for t in ("ngram", "n_gram", "residual",
+                                            "sparse", "hash", "sub_table",
+                                            "subtable", "over_enc", "expand")):
+                print("  %-40s %s" % (p, v if not isinstance(v, (dict, list)) else type(v).__name__))
+                hits += 1
+            walk(v, p)
+    elif isinstance(node, list):
+        for i, v in enumerate(node[:4]):
+            walk(v, "%s[%d]" % (path, i))
+walk(cfg)
+if hits == 0:
+    print("  nothing, the new parts may be named differently. Read config.json.")
+
+print()
+print("vision tower  : %s" % ("yes, mmproj needed" if
+      ("vision_config" in cfg or os.path.exists(os.path.join(d, "preprocessor_config.json")))
+      else "no"))
+PROBEEOF
+
+    echo
+    echo "=============== 3. does OUR converter know this class ==============="
+    local cls
+    cls=$(python3 -c "import json;print((json.load(open('/probe/config.json')).get('architectures') or ['?'])[0])")
+    echo "looking for $cls in /llama.cpp"
+    if [ -d /llama.cpp ]; then
+        if grep -rq "$cls" /llama.cpp/conversion/ /llama.cpp/convert_hf_to_gguf.py 2>/dev/null; then
+            echo "  FOUND. convert_hf_to_gguf.py can read this model."
+        else
+            echo "  NOT FOUND. The converter will abort with 'Model $cls is not"
+            echo "  supported'. No GGUF is possible until that class is added and"
+            echo "  the graph is written in C++."
+        fi
+    else
+        echo "  no /llama.cpp on this box yet, run build first"
+    fi
+
+    echo
+    echo "=============== 4. tensor layout, from the shard headers ==============="
+    python3 - "$repo" << 'HDREOF'
+import json, os, re, sys, collections
+from huggingface_hub import hf_hub_url, get_hf_file_metadata
+import requests
+
+repo = sys.argv[1]
+idx = "/probe/model.safetensors.index.json"
+if os.path.exists(idx):
+    shards = sorted(set(json.load(open(idx))["weight_map"].values()))
+else:
+    shards = ["model.safetensors"]
+print("%d shard(s), reading only their headers" % len(shards))
+
+DT = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "F8_E5M2": 1,
+      "I8": 1, "U8": 1, "I32": 4, "I64": 8, "F64": 8}
+
+tensors = {}
+got = 0
+for i, s in enumerate(shards):
+    url = hf_hub_url(repo, s)
+    try:
+        r = requests.get(url, headers={"Range": "bytes=0-7"}, timeout=30)
+        n = int.from_bytes(r.content[:8], "little")
+        r = requests.get(url, headers={"Range": "bytes=8-%d" % (8 + n - 1)}, timeout=60)
+        head = json.loads(r.content[:n])
+    except Exception as e:
+        print("  shard %s unreadable: %s" % (s, str(e).splitlines()[0][:60]))
+        continue
+    for name, meta in head.items():
+        if name == "__metadata__":
+            continue
+        tensors[name] = meta
+    got += 1
+    if (i + 1) % 10 == 0 or i == len(shards) - 1:
+        print("  %d/%d headers read, %d tensors so far" % (i + 1, len(shards), len(tensors)),
+              flush=True)
+
+if not tensors:
+    print("could not read any header. Falling back to the index only.")
+    sys.exit(0)
+
+def group(name):
+    n = re.sub(r"\.\d+\.", ".N.", name)
+    n = re.sub(r"^(model|language_model|transformer)\.", "", n)
+    n = re.sub(r"^layers\.N\.", "blk.", n)
+    return n.rsplit(".weight", 1)[0].rsplit(".bias", 1)[0]
+
+g = collections.defaultdict(lambda: {"n": 0, "params": 0, "bytes": 0,
+                                     "dtype": set(), "shape": None})
+for name, m in tensors.items():
+    p = 1
+    for x in m["shape"]:
+        p *= x
+    e = g[group(name)]
+    e["n"] += 1
+    e["params"] += p
+    e["bytes"] += p * DT.get(m["dtype"], 2)
+    e["dtype"].add(m["dtype"])
+    if e["shape"] is None:
+        e["shape"] = m["shape"]
+
+total_p = sum(e["params"] for e in g.values())
+total_b = sum(e["bytes"] for e in g.values())
+print()
+print("%d tensors, %.1f B parameters, %.0f GB on the wire"
+      % (len(tensors), total_p / 1e9, total_b / 1e9))
+print()
+print("%-46s %5s %11s %8s %8s %s" % ("tensor group", "count", "params", "share", "GB", "dtype"))
+for k, e in sorted(g.items(), key=lambda kv: -kv[1]["params"]):
+    if e["params"] < total_p * 0.001:
+        continue
+    print("%-46s %5d %10.2fB %7.1f%% %8.1f %s"
+          % (k[:46], e["n"], e["params"] / 1e9, 100 * e["params"] / total_p,
+             e["bytes"] / 1e9, ",".join(sorted(e["dtype"]))))
+
+emb = sum(e["params"] for k, e in g.items()
+          if any(t in k.lower() for t in ("ngram", "n_gram", "embed", "sub_table", "subtable")))
+print()
+print("lookup-shaped parameters (embedding and n-gram tables): %.1f B, %.0f%% of the model"
+      % (emb / 1e9, 100 * emb / total_p))
+print("Those are gather operations, not matmuls, so llama-imatrix collects no")
+print("statistics for them and they quantize blind however good the corpus is.")
+
+json.dump({k: {"count": v["n"], "params": v["params"], "bytes": v["bytes"],
+               "dtype": sorted(v["dtype"]), "shape": v["shape"]}
+           for k, v in g.items()},
+          open("/logs/tensor-layout.json", "w"), indent=2)
+print()
+print("written to /logs/tensor-layout.json")
+HDREOF
+
+    echo
+    echo "next: if the converter does not know the class, nothing downstream can"
+    echo "run. Decide there before renting anything with a GPU in it."
+}
 
 # ================================================================== state
 # Read back whatever the last pane set, so a fresh tmux tab is not amnesiac.
