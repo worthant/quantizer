@@ -5,7 +5,7 @@
 # it does not need foundry-mlx2.sh. On a bare rented box:
 #
 #   export HF_TOKEN=hf_...
-#   curl -sL https://raw.githubusercontent.com/worthant/quantizer/main/foundry-mlx3.sh -o /mlx3.sh
+#   curl -sL https://raw.githubusercontent.com/AtomicBot-ai/atomic-quantizer/main/foundry-mlx3.sh -o /mlx3.sh
 #   source /mlx3.sh
 #   mlx3_setup
 #   mlx3_persist
@@ -13,7 +13,7 @@
 #
 # raw.githubusercontent sits behind a CDN and can hand back a file that is
 # minutes old. If a fresh push is not showing up, clone instead:
-#   git clone https://github.com/worthant/quantizer /quantizer
+#   git clone https://github.com/AtomicBot-ai/atomic-quantizer /quantizer
 #   source /quantizer/foundry-mlx3.sh
 #
 # WHAT THIS FILE IS FOR
@@ -2624,7 +2624,7 @@ Job: build the 3 bit rung, re-round both rungs, publish the bases the second
 box needs, settle what counts as a result, measure what clipping alone bought.
 
   export HF_TOKEN=hf_...
-  curl -sL https://raw.githubusercontent.com/worthant/quantizer/main/foundry-mlx3.sh -o /mlx3.sh
+  curl -sL https://raw.githubusercontent.com/AtomicBot-ai/atomic-quantizer/main/foundry-mlx3.sh -o /mlx3.sh
   source /mlx3.sh
   mlx3_setup
   mlx3_check                      <- READ THIS BEFORE ANYTHING ELSE
@@ -2688,7 +2688,7 @@ eight minutes, so two lanes plus their measurements fit in well under an hour,
 which is cheaper than two expensive boxes in parallel.
 
   export HF_TOKEN=hf_...
-  curl -sL https://raw.githubusercontent.com/worthant/quantizer/main/foundry-mlx3.sh -o /mlx3.sh
+  curl -sL https://raw.githubusercontent.com/AtomicBot-ai/atomic-quantizer/main/foundry-mlx3.sh -o /mlx3.sh
   source /mlx3.sh
   mlx3_setup
   mlx3_check
@@ -2784,7 +2784,7 @@ PLAN      mlx3_plan | mlx3_box hub | mlx3_box dwq
 FROM NOTHING, ON A FRESH BOX
 
   export HF_TOKEN=hf_...
-  curl -sL https://raw.githubusercontent.com/worthant/quantizer/main/foundry-mlx3.sh -o /mlx3.sh
+  curl -sL https://raw.githubusercontent.com/AtomicBot-ai/atomic-quantizer/main/foundry-mlx3.sh -o /mlx3.sh
   source /mlx3.sh
   mlx3_setup
   mlx3_persist

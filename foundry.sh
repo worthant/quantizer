@@ -71,7 +71,7 @@ reload() {
         git -C /quantizer fetch -q origin && git -C /quantizer reset -q --hard origin/HEAD || return 1
     else
         rm -rf /quantizer
-        git clone -q https://github.com/worthant/quantizer /quantizer || return 1
+        git clone -q https://github.com/AtomicBot-ai/atomic-quantizer /quantizer || return 1
     fi
 
     echo "commit: $(git -C /quantizer log -1 --format='%h %ad %s' --date=short)"
@@ -2396,7 +2396,7 @@ install_auto_fmt() {
         echo "no pipeline yet. Run get_tools."
         return 1
     fi
-    curl -sL https://raw.githubusercontent.com/worthant/quantizer/main/auto_fmt.py \
+    curl -sL https://raw.githubusercontent.com/AtomicBot-ai/atomic-quantizer/main/auto_fmt.py \
         -o /calib-corpora/tools/auto_fmt.py || return 1
 
     if grep -q '"auto"' /calib-corpora/tools/build.py; then
