@@ -15,7 +15,6 @@ when something is missing.
 | `foundry.sh` | the GGUF side. Box setup, llama.cpp build, corpus, imatrix, quantize ladder, KLD, uploads |
 | `foundry-mlx3.sh` | the MLX side. Self contained, does not need `foundry.sh` |
 | `auto_fmt.py` | generic chat renderer. The canonical copy lives in `calib-corpora/tools/` |
-| `probe.sh` | not audited, not documented. Read it before running it |
 
 Details on each file: [docs/scripts.md](docs/scripts.md).
 

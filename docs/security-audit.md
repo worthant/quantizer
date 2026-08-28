@@ -3,8 +3,7 @@
 What was checked, what was found, and what has to change before anyone else runs
 these scripts.
 
-Audited: `foundry.sh`, `foundry-mlx3.sh`, `auto_fmt.py`. **`probe.sh` was not
-reviewed** and has to go through the same checklist below.
+Audited: `foundry.sh`, `foundry-mlx3.sh`, `auto_fmt.py`. 
 
 ## Credentials
 
@@ -122,7 +121,6 @@ Then check the things grep cannot see:
 
 - the private ssh key and `known_hosts` are not in the tree
 - `.env`, `.envrc`, `*.token`, `*.pem`, `.netrc` are not in the tree
-- `probe.sh` has been read line by line, since it was not part of this audit
 
 > [!IMPORTANT]
 > A clean working tree says nothing about the history. If a token was ever
