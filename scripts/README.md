@@ -50,11 +50,11 @@ Three environment settings in it are defaults for a reason, and all three cost a
 day to find. They are explained in the file's own comments and in
 [troubleshooting.md](troubleshooting.md):
 
-| setting | value | why |
-| --- | --- | --- |
-| `MLX_USE_CUDA_GRAPHS` | 0 | a compiled graph remembers buffer addresses the allocator later reuses. Turning capture off removes a whole class of failures for about two seconds a step |
-| `MLX_CUDA_GRAPH_CACHE_SIZE` | 2048 | 1 aborts with cache thrashing, 6144 runs out of memory |
-| `MLX3_SEQ` | 512 | collapses the long tail of tensor shapes into one, which is what makes memory flat rather than climbing |
+| setting                     | value | why                                                                                                                                                        |
+| --------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MLX_USE_CUDA_GRAPHS`       | 0     | a compiled graph remembers buffer addresses the allocator later reuses. Turning capture off removes a whole class of failures for about two seconds a step |
+| `MLX_CUDA_GRAPH_CACHE_SIZE` | 2048  | 1 aborts with cache thrashing, 6144 runs out of memory                                                                                                     |
+| `MLX3_SEQ`                  | 512   | collapses the long tail of tensor shapes into one, which is what makes memory flat rather than climbing                                                    |
 
 ## `auto_fmt.py`
 
@@ -77,16 +77,28 @@ pinned, rather than quietly producing a corpus nobody can rebuild:
 export FOUNDRY_PIN_DATE=2026-08-14
 ```
 
-> [!NOTE]
-> The canonical copy lives in `calib-corpora/tools/auto_fmt.py`. The copy here
-> exists only so `install_auto_fmt` can curl it onto a box. Since that box has
-> already cloned calib-corpora at that point, the function could read from the
-> clone and this duplicate could go.
+> [!NOTE] The canonical copy lives in `calib-corpora/tools/auto_fmt.py`. The
+> copy here exists only so `install_auto_fmt` can curl it onto a box. Since that
+> box has already cloned calib-corpora at that point, the function could read
+> from the clone and this duplicate could go.
 
-## `probe.sh`
+## ABLITERATION
 
-Not part of the security audit and not documented. Read it before running it,
-and add a paragraph here saying what it does.
+1. curl foundry
+2. load model:
+
+```bash
+use_model qwen3.8-flash-next Qwen/Qwen3.8-Flash-Next
+```
+
+3. convert and convert to gguf:
+
+```bash
+abliterate_and_convert_to_gguf
+```
+-> /abliterated-Qwen/Qwen3.8-Flash-Next
+
+4. use test_chat e.t.c. to ensure abliterated model works
 
 ## How they are meant to be used
 

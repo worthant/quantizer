@@ -6489,6 +6489,168 @@ HDREOF
     echo "run. Decide there before renting anything with a GPU in it."
 }
 
+# ======= ABLITERATE!!! ===========
+
+# Fetch refusal and compliant example files from the calib-corpora dataset
+# If not found, create default files locally.
+get_abliteration_examples() {
+    local out_dir="${1:-/tmp/ablit}"
+    mkdir -p "$out_dir"
+    local refusal="$out_dir/refusal.txt"
+    local compliant="$out_dir/compliant.txt"
+
+    # Try to fetch from the dataset repo
+    if fetch_one AtomicChat/calib-corpora dataset "abliteration/refusal.txt" "$refusal" 2>/dev/null; then
+        echo "Refusal examples fetched from calib-corpora"
+    else
+        echo "Refusal examples not found in calib-corpora, using built-in defaults"
+        cat > "$refusal" << 'REFEOF'
+I cannot answer that question.
+I'm sorry, I can't help with that.
+As an AI, I'm not allowed to respond.
+I don't have enough information to answer.
+I'm unable to provide that.
+I am not programmed to assist with that.
+That request goes against my guidelines.
+I cannot fulfill this request.
+I'm afraid I can't do that.
+I will not respond to that.
+REFEOF
+    fi
+
+    if fetch_one AtomicChat/calib-corpora dataset "abliteration/compliant.txt" "$compliant" 2>/dev/null; then
+        echo "Compliant examples fetched from calib-corpora"
+    else
+        echo "Compliant examples not found in calib-corpora, using built-in defaults"
+        cat > "$compliant" << 'COMPEOF'
+Sure, here is the information.
+Of course, I can help you with that.
+Yes, here are the steps to do it.
+The answer is 42.
+Here is a detailed explanation.
+Certainly, I will assist you.
+Absolutely, let me provide that.
+I would be happy to help.
+Here is the solution you asked for.
+Let me explain that in detail.
+COMPEOF
+    fi
+
+    echo "$refusal $compliant"
+}
+
+# abliterate [--alpha 1.0] [--output OUT_DIR]
+# Uses the current UPSTREAM model (must have run use_model).
+# Automatically downloads the original HF model if not present.
+abliterate() {
+    need_preset || return 1
+
+    local alpha="${1:-1.0}"
+    local out="${2:-/abliterated-$(basename $UPSTREAM)}"
+
+    # Ensure the Python script is installed
+    install_abliterate || return 1
+
+    # Ensure the source HF model is available
+    if [ ! -d /src ] || [ -z "$(ls -A /src 2>/dev/null)" ]; then
+        echo "Original HF model not found in /src. Downloading now..."
+        get_upstream || return 1
+    fi
+
+    # Get refusal and compliant examples
+    local files
+    files=$(get_abliteration_examples /tmp/ablit)
+    local refusal=$(echo "$files" | awk '{print $1}')
+    local compliant=$(echo "$files" | awk '{print $2}')
+
+    if [ ! -f "$refusal" ] || [ ! -f "$compliant" ]; then
+        echo "Failed to obtain refusal/compliant examples."
+        return 1
+    fi
+
+    echo "Running abliteration on $UPSTREAM"
+    echo "Refusal examples: $refusal ($(wc -l < "$refusal") lines)"
+    echo "Compliant examples: $compliant ($(wc -l < "$compliant") lines)"
+    echo "Alpha: $alpha"
+    echo "Output: $out"
+
+    python3 /abliterate.py \
+        --model /src \
+        --refusal "$refusal" \
+        --compliant "$compliant" \
+        --output "$out" \
+        --alpha "$alpha"
+
+    if [ $? -eq 0 ]; then
+        echo "Abliteration completed. Model saved to $out"
+        echo "To convert to GGUF, run:"
+        echo "  python3 /llama.cpp/convert_hf_to_gguf.py $out --outtype bf16 --outfile /gguf/$(basename $UPSTREAM)-abliterated-BF16.gguf"
+        echo "Then quantize with your ladder."
+    else
+        echo "Abliteration failed."
+        return 1
+    fi
+}
+
+# abliterate_and_quantize [--alpha 1.0] [--output OUT_DIR]
+# Does abliteration, converts to BF16 GGUF, and quantizes with the default ladder.
+abliterate_and_convert_to_gguf() {
+    local alpha="${1:-1.0}"
+    local out="${2:-/abliterated-$(basename $UPSTREAM)}"
+
+    abliterate "$alpha" "$out" || return 1
+
+    # Convert to BF16 GGUF
+    local bf16_gguf="/gguf/$(basename $UPSTREAM)-abliterated-BF16.gguf"
+    echo "Converting to BF16 GGUF: $bf16_gguf"
+    python3 /llama.cpp/convert_hf_to_gguf.py "$out" --outtype bf16 --outfile "$bf16_gguf" || return 1
+
+    echo "BF16 GGUF created. Now you can quantize using your ladder."
+    echo "For example:"
+    echo "  ladder /ladder.txt"
+    echo "Or run:"
+    echo "  quantize AD-ABLIT-Q4_K Q8_0 --tensor-type ..."
+}
+
+# Simplified wrapper that uses the current UPSTREAM model (from /src)
+# Assumes you have already run get_upstream or have the model in /src.
+abliterate_upstream() {
+    need_preset || return 1
+    if [ ! -d /src ]; then
+        echo "Source model not available. Run get_upstream first."
+        return 1
+    fi
+    local out="${1:-/abliterated-$(basename $UPSTREAM)}"
+    local alpha="${2:-1.0}"
+    abliterate /src "$alpha" "$out"
+}
+
+# Ensure /abliterate.py exists, download if missing.
+install_abliterate() {
+    local target="/abliterate.py"
+    if [ -f "$target" ]; then
+        echo "abliterate.py already present"
+        return 0
+    fi
+    echo "Downloading abliterate.py from calib-corpora..."
+    # Try to fetch from the dataset repo first
+    if fetch_one AtomicChat/calib-corpora dataset "tools/abliterate.py" "$target" 2>/dev/null; then
+        echo "Downloaded from calib-corpora"
+        chmod +x "$target"
+        return 0
+    fi
+    # Fallback to a raw URL (you can change this)
+    local url="https://huggingface.co/AtomicChat/calib-corpora/resolve/main/tools/abliterate.py"
+    if curl -sL "$url" -o "$target"; then
+        echo "Downloaded from $url"
+        chmod +x "$target"
+        return 0
+    fi
+    echo "ERROR: Could not download abliterate.py"
+    return 1
+}
+
+
 # ================================================================== state
 # Read back whatever the last pane set, so a fresh tmux tab is not amnesiac.
 if [ -f /state.sh ]; then
